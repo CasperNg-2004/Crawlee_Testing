@@ -1,0 +1,19 @@
+{
+  "name": "kl-google-maps-restaurant-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A small Crawlee starter for collecting public restaurant details from Google Maps.",
+  "scripts": {
+    "start": "node --env-file=.env src/main.js",
+    "start:visible": "cross-env HEADLESS=false node --env-file=.env src/main.js"
+  },
+  "dependencies": {
+    "crawlee": "^3.15.0",
+    "cross-env": "^10.0.0",
+    "playwright": "^1.55.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
