@@ -5,6 +5,7 @@
   "type": "module",
   "description": "A small Crawlee starter for collecting public restaurant details from Google Maps.",
   "scripts": {
+    "login": "node --env-file=.env src/login.js",
     "start": "node --env-file=.env src/main.js",
     "start:visible": "cross-env HEADLESS=false node --env-file=.env src/main.js"
   },

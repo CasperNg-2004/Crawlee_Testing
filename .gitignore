@@ -4,4 +4,6 @@ output/
 output-*/
 storage-*/
 .env
+google-auth-state.json
+.chrome-profile/
 *.log
