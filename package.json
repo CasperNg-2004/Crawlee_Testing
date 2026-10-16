@@ -7,6 +7,8 @@
   "scripts": {
     "login": "node --env-file=.env src/login.js",
     "start": "node --env-file=.env src/main.js",
+    "start:safe": "node --env-file=.env src/safe-run.js",
+    "resume:safe": "node --env-file=.env src/safe-run.js --resume",
     "start:visible": "cross-env HEADLESS=false node --env-file=.env src/main.js"
   },
   "dependencies": {

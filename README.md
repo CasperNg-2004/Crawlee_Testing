@@ -103,6 +103,8 @@ Copy `.env.example` to `.env` if `.env` does not already exist, then edit the va
 
 ```dotenv
 QUERY=restaurants
+# Optional separate searches, combined and deduplicated into one output.
+# QUERIES=cafes|drinks
 AREA=Kuala Lumpur, Malaysia
 MAX_PLACES=1000
 MAX_CANDIDATES_PER_AREA=150
@@ -118,6 +120,7 @@ CHROME_PROFILE_DIR=.chrome-profile
 | Setting | Meaning |
 | --- | --- |
 | `QUERY` | Google Maps search phrase, such as `restaurants` or `halal restaurants`. An exact restaurant name is also supported. |
+| `QUERIES` | Optional `\|`-separated search phrases, such as `cafes\|drinks`. Takes precedence over `QUERY`; all query/area combinations are searched and deduplicated. |
 | `AREA` | Single fallback search area. Used only when `AREAS` is empty or unset. |
 | `AREAS` | Multiple search areas separated by `\|`. This takes precedence over `AREA`. |
 | `MAX_PLACES` | Shared maximum number of restaurants in the final output, not a per-area limit. |
@@ -128,13 +131,34 @@ CHROME_PROFILE_DIR=.chrome-profile
 | `CHROME_PROFILE_DIR` | Dedicated signed-in Chrome profile used by login and scraping. |
 | `CHROME_PATH` | Optional path to Chrome when it is installed in a non-standard location. |
 
-`MAX_PLACES` is shared across all areas. Discovery completes for every area first, then a deduplicated round-robin selection gives each area a fair opportunity to contribute restaurants. For example, `MAX_PLACES=100` means up to 100 total restaurants, not 100 from every area.
+`MAX_PLACES` is shared across all queries and areas. Discovery completes for every query/area combination first, then a deduplicated round-robin selection gives each combination a fair opportunity to contribute places. For example, `MAX_PLACES=100` means up to 100 total places, not 100 from every query or area.
 
 Smaller districts normally provide better coverage than one broad Kuala Lumpur search. Increase `MAX_CANDIDATES_PER_AREA` if an area can provide more candidates and you want it to participate more deeply in the final selection.
 
 ## Running the scraper
 
-Run with the settings in `.env`:
+For photo scraping or longer runs, use safe mode. It processes a small batch,
+fully closes Chrome to release memory and the dedicated profile, then resumes
+the same Crawlee queue automatically:
+
+```powershell
+npm run start:safe
+```
+
+If a safe run was interrupted by a shutdown, manual stop, or browser failure,
+resume the existing queue without purging completed work:
+
+```powershell
+npm run resume:safe
+```
+
+Safe mode defaults to four restaurant-detail requests per Chrome process. The
+batch size, restart delay, and consecutive-failure limit can be configured with
+`SAFE_BATCH_SIZE`, `SAFE_RESTART_DELAY_MS`, and
+`SAFE_MAX_CONSECUTIVE_FAILURES` in `.env`.
+
+Plain `npm start` runs the scraper in one process. Use it for short tests or a
+single restaurant; it is not recommended for large photo-enabled runs:
 
 ```powershell
 npm start

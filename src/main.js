@@ -1,12 +1,22 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PlaywrightCrawler, Dataset, createPlaywrightRouter, log } from 'crawlee';
+import {
+  PlaywrightCrawler,
+  Dataset,
+  RequestQueue,
+  createPlaywrightRouter,
+  log,
+} from 'crawlee';
 
 // PowerShell truncates Format-Table output to the terminal width on Windows.
 // Crawlee expects the complete `WorkingSetSize` process-list header.
 if (process.platform === 'win32') process.env.COLUMNS = '200';
 
 const query = process.env.QUERY?.trim() || 'restaurant';
+const queries = (process.env.QUERIES?.trim() || query)
+  .split('|')
+  .map((value) => value.trim())
+  .filter(Boolean);
 const area = process.env.AREA?.trim() || 'Kuala Lumpur, Malaysia';
 const maxPlaces = positiveInteger(process.env.MAX_PLACES, 1000);
 const maxStalledScrolls = positiveInteger(process.env.MAX_STALLED_SCROLLS, 12);
@@ -18,6 +28,11 @@ const areas = (process.env.AREAS?.trim() || area)
   .split('|')
   .map((value) => value.trim())
   .filter(Boolean);
+const searchTargets = queries.flatMap((searchQuery) => areas.map((searchArea) => ({
+  key: `${searchQuery}\u0000${searchArea}`,
+  query: searchQuery,
+  area: searchArea,
+})));
 const maxCandidatesPerArea = positiveInteger(process.env.MAX_CANDIDATES_PER_AREA, 150);
 const scrapePhotos = booleanValue(process.env.SCRAPE_PHOTOS, false);
 const photoTabs = (process.env.PHOTO_TABS?.trim() || 'All|Menu|By owner')
@@ -49,7 +64,7 @@ const failedRestaurantRecords = [];
 
 const router = createPlaywrightRouter();
 
-router.addHandler('SEARCH', async ({ page, request, addRequests, log: requestLog }) => {
+router.addHandler('SEARCH', async ({ page, request, log: requestLog }) => {
   await acceptConsentIfShown(page);
 
   const feed = page.locator('div[role="feed"]');
@@ -103,9 +118,9 @@ router.addHandler('SEARCH', async ({ page, request, addRequests, log: requestLog
     }
   }
 
-  areaCandidates.set(request.userData.area, [...placeUrls]);
+  areaCandidates.set(request.userData.searchKey, [...placeUrls]);
   requestLog.info(`Discovery finished for ${request.userData.area}: ${placeUrls.size} candidates stored.`);
-  await queueDetailsWhenDiscoveryComplete(addRequests);
+  await queueDetailsWhenDiscoveryComplete();
 });
 
 router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog }) => {
@@ -299,7 +314,7 @@ const crawler = new PlaywrightCrawler({
     request.userData.startedAt = Date.now();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-MY,en;q=0.9' });
   }],
-  failedRequestHandler: async ({ request, error, addRequests, log: requestLog }) => {
+  failedRequestHandler: async ({ request, error, log: requestLog }) => {
     const elapsedMs = Date.now() - (request.userData.startedAt ?? Date.now());
     if (request.label === 'DETAIL') {
       failedPlaceCount += 1;
@@ -314,8 +329,8 @@ const crawler = new PlaywrightCrawler({
         failedAt: new Date().toISOString(),
       });
     } else if (request.label === 'SEARCH') {
-      areaCandidates.set(request.userData.area, []);
-      await queueDetailsWhenDiscoveryComplete(addRequests);
+      areaCandidates.set(request.userData.searchKey, []);
+      await queueDetailsWhenDiscoveryComplete();
     }
     requestLog.error(`Failed after retries in ${formatDuration(elapsedMs)}: ${request.url}`, {
       label: request.label,
@@ -325,11 +340,11 @@ const crawler = new PlaywrightCrawler({
   },
 });
 
-const searchRequests = areas.map((searchArea) => ({
-  url: buildSearchUrl(query, searchArea),
+const searchRequests = searchTargets.map(({ key, query: searchQuery, area: searchArea }) => ({
+  url: buildSearchUrl(searchQuery, searchArea),
   label: 'SEARCH',
-  uniqueKey: `search:${query}:${searchArea}`,
-  userData: { area: searchArea },
+  uniqueKey: `search:${searchQuery}:${searchArea}`,
+  userData: { searchKey: key, query: searchQuery, area: searchArea },
 }));
 
 const initialRequests = directPlaceUrls.length
@@ -345,7 +360,10 @@ if (directPlaceUrls.length) {
   queuedPlaceCount = initialRequests.length;
   log.info(`Scraping ${queuedPlaceCount} direct Google Maps place URL(s).`);
 } else {
-  log.info(`Searching for "${query}" across ${areas.length} area(s), up to ${maxPlaces} unique places.`);
+  log.info(
+    `Searching for ${queries.map((value) => `"${value}"`).join(', ')} across `
+    + `${areas.length} area(s) (${searchTargets.length} searches), up to ${maxPlaces} unique places.`,
+  );
 }
 log.info(`Using the dedicated Chrome profile at ${chromeProfileDir}. Run \`npm run login\` if Maps requests sign-in.`);
 log.info(`Keeping one Chrome session for up to ${browserPageBudget} page uses to avoid profile-lock relaunches.`);
@@ -404,30 +422,38 @@ function buildSearchUrl(searchQuery, searchArea) {
   return `https://www.google.com/maps/search/${encodeURIComponent(`${searchQuery} in ${searchArea}`)}?hl=en`;
 }
 
-async function queueDetailsWhenDiscoveryComplete(addRequests) {
-  if (detailRequestsQueued || areaCandidates.size < areas.length) return;
+async function queueDetailsWhenDiscoveryComplete() {
+  if (detailRequestsQueued || areaCandidates.size < searchTargets.length) return;
   detailRequestsQueued = true;
 
-  const detailRequests = selectFairCandidates(areaCandidates, areas, maxPlaces, query);
+  const detailRequests = selectFairCandidates(areaCandidates, searchTargets, maxPlaces);
   queuedPlaceCount = detailRequests.length;
-  logDiscoverySummary(areaCandidates, areas, detailRequests);
+  logDiscoverySummary(areaCandidates, searchTargets, detailRequests);
   log.info(`Fair round-robin selection queued ${queuedPlaceCount} unique places for detail scraping.`);
 
-  if (detailRequests.length) await addRequests(detailRequests);
+  if (detailRequests.length) {
+    // Add directly to the underlying queue instead of the crawler-context
+    // addRequests helper. The helper obeys maxRequestsPerCrawl and previously
+    // discarded every detail request beyond the first safe batch. Direct queue
+    // insertion stores all selected places while the crawler still stops at
+    // the process-level request limit.
+    const requestQueue = await RequestQueue.open();
+    await requestQueue.addRequests(detailRequests);
+  }
 }
 
-function selectFairCandidates(candidatesByArea, areaOrder, limit, searchQuery) {
-  const cursors = new Map(areaOrder.map((searchArea) => [searchArea, 0]));
+function selectFairCandidates(candidatesByTarget, targets, limit) {
+  const cursors = new Map(targets.map(({ key }) => [key, 0]));
   const seenPlaces = new Set();
   const selected = [];
 
   while (selected.length < limit) {
     let selectedThisRound = 0;
 
-    for (const searchArea of areaOrder) {
+    for (const target of targets) {
       if (selected.length >= limit) break;
-      const candidates = candidatesByArea.get(searchArea) || [];
-      let cursor = cursors.get(searchArea) || 0;
+      const candidates = candidatesByTarget.get(target.key) || [];
+      let cursor = cursors.get(target.key) || 0;
 
       while (cursor < candidates.length) {
         const url = candidates[cursor];
@@ -441,16 +467,16 @@ function selectFairCandidates(candidatesByArea, areaOrder, limit, searchQuery) {
           uniqueKey: identity,
           label: 'DETAIL',
           userData: {
-            searchUrl: buildSearchUrl(searchQuery, searchArea),
-            query: searchQuery,
-            area: searchArea,
+            searchUrl: buildSearchUrl(target.query, target.area),
+            query: target.query,
+            area: target.area,
           },
         });
         selectedThisRound += 1;
         break;
       }
 
-      cursors.set(searchArea, cursor);
+      cursors.set(target.key, cursor);
     }
 
     if (selectedThisRound === 0) break;
@@ -469,17 +495,17 @@ function placeIdentity(url) {
   return cleanPlaceUrl(url);
 }
 
-function logDiscoverySummary(candidatesByArea, areaOrder, selectedRequests) {
-  const selectedCounts = new Map(areaOrder.map((searchArea) => [searchArea, 0]));
+function logDiscoverySummary(candidatesByTarget, targets, selectedRequests) {
+  const selectedCounts = new Map(targets.map(({ key }) => [key, 0]));
   for (const request of selectedRequests) {
-    const searchArea = request.userData.area;
-    selectedCounts.set(searchArea, (selectedCounts.get(searchArea) || 0) + 1);
+    const key = `${request.userData.query}\u0000${request.userData.area}`;
+    selectedCounts.set(key, (selectedCounts.get(key) || 0) + 1);
   }
 
-  for (const searchArea of areaOrder) {
-    log.info(`Area allocation: ${searchArea}`, {
-      discovered: candidatesByArea.get(searchArea)?.length || 0,
-      selected: selectedCounts.get(searchArea) || 0,
+  for (const target of targets) {
+    log.info(`Search allocation: ${target.query} in ${target.area}`, {
+      discovered: candidatesByTarget.get(target.key)?.length || 0,
+      selected: selectedCounts.get(target.key) || 0,
     });
   }
 }
@@ -590,7 +616,12 @@ async function getMenuCategoryNames(page) {
 
 async function clickMenuCategory(page, categoryName) {
   const candidates = page.locator('[role="tab"]').filter({
-    hasText: new RegExp(`^\\s*${escapeRegExp(categoryName)}\\s*$`, 'i'),
+    // Playwright serializes regular-expression text filters into its internal
+    // selector syntax. Category names containing repeated apostrophes (for
+    // example, an inch measurement such as 9.5'') can be misread as selector
+    // flags. Use a plain-text candidate filter and retain the exact aria-label
+    // comparison below.
+    hasText: categoryName,
   });
 
   for (let index = 0; index < await candidates.count(); index += 1) {
