@@ -221,7 +221,10 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
   });
   Object.assign(details, headerSummary);
 
-  const peakHours = derivePeakHours(details.popularTimeLabels);
+  const popularTimes = await extractPopularTimes(page);
+  const peakHours = popularTimes
+    ? derivePeakHoursFromBreakdown(popularTimes)
+    : derivePeakHours(details.popularTimeLabels);
   delete details.popularTimeLabels;
   const menu = await extractGoogleMenu(page);
   const about = await extractAbout(page);
@@ -244,6 +247,7 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
     menu,
     photos: photoResult.photos,
     photoScrape: photoResult.photoScrape,
+    popularTimes,
     peakHours,
     about,
     contact: {
@@ -277,6 +281,11 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
       photoScrapeStatus: record.photoScrape?.status ?? null,
       openingHours: record.openingHours,
       peakHours: record.peakHours,
+      popularTimesSummary: record.popularTimes ? {
+        overallPeak: record.popularTimes.overallPeak,
+        overallQuietest: record.popularTimes.overallQuietest,
+        daysWithData: record.popularTimes.days.filter((day) => day.hours.length > 0).length,
+      } : null,
       about: record.about,
       url: canonicalUrl,
     },
@@ -1262,10 +1271,106 @@ function derivePeakHours(popularTimes) {
   return popularTimes.filter((label) => /as busy as it gets|very busy|peak/i.test(label));
 }
 
+async function extractPopularTimes(page) {
+  const rawDays = await page.evaluate(() => {
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const regions = [...document.querySelectorAll('[role="region"][aria-label]')];
+    const region = regions.find((element) => /popular times at/i.test(element.getAttribute('aria-label') || ''));
+    if (!region) return null;
+
+    const containers = [region, ...region.querySelectorAll('*')];
+    const chartContainer = containers.find((element) => {
+      const children = [...element.children];
+      if (children.length !== 7) return false;
+      return children.some((child) =>
+        child.querySelector('[role="img"][aria-label*="% busy at" i]')
+        || /closed\s+(?:sun|mon|tues|wednes|thurs|fri|satur)days?/i.test(child.textContent || ''),
+      );
+    });
+    if (!chartContainer) return null;
+
+    return [...chartContainer.children].map((panel, dayIndex) => {
+      const hours = [...panel.querySelectorAll('[role="img"][aria-label]')]
+        .map((element) => element.getAttribute('aria-label')?.replace(/\s+/g, ' ').trim())
+        .map((label) => {
+          const match = label?.match(/(\d{1,3})%\s*busy at\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+          if (!match) return null;
+          const busynessPercent = Number(match[1]);
+          const hour12 = Number(match[2]);
+          const minute = Number(match[3] || 0);
+          const period = match[4].toLowerCase();
+          const hour = (hour12 % 12) + (period === 'pm' ? 12 : 0);
+          const time = `${hour12}${minute ? `:${String(minute).padStart(2, '0')}` : ''} ${period}`;
+          return { time, hour, minute, busynessPercent, label };
+        })
+        .filter(Boolean);
+
+      return { day: dayNames[dayIndex], hours };
+    });
+  }).catch(() => null);
+
+  if (!rawDays) return null;
+
+  const days = rawDays.map((day) => {
+    // Google often renders 0% outside opening hours. Keep those raw readings,
+    // but do not call them the quietest period because they can mean closed.
+    const activeHours = day.hours.filter(({ busynessPercent }) => busynessPercent > 0);
+    const peakValue = activeHours.length
+      ? Math.max(...activeHours.map(({ busynessPercent }) => busynessPercent))
+      : null;
+    const quietValue = activeHours.length
+      ? Math.min(...activeHours.map(({ busynessPercent }) => busynessPercent))
+      : null;
+    return {
+      ...day,
+      peak: peakValue == null
+        ? null
+        : activeHours.filter(({ busynessPercent }) => busynessPercent === peakValue).map(summarizeBusyHour),
+      quietest: quietValue == null
+        ? null
+        : activeHours.filter(({ busynessPercent }) => busynessPercent === quietValue).map(summarizeBusyHour),
+    };
+  });
+
+  const activeReadings = days.flatMap((day) => day.hours
+    .filter(({ busynessPercent }) => busynessPercent > 0)
+    .map((hour) => ({ day: day.day, ...summarizeBusyHour(hour) })));
+  const peakValue = activeReadings.length
+    ? Math.max(...activeReadings.map(({ busynessPercent }) => busynessPercent))
+    : null;
+  const quietValue = activeReadings.length
+    ? Math.min(...activeReadings.map(({ busynessPercent }) => busynessPercent))
+    : null;
+
+  return {
+    source: 'google_maps',
+    unit: 'relative_busyness_percent',
+    days,
+    overallPeak: peakValue == null
+      ? null
+      : activeReadings.filter(({ busynessPercent }) => busynessPercent === peakValue),
+    overallQuietest: quietValue == null
+      ? null
+      : activeReadings.filter(({ busynessPercent }) => busynessPercent === quietValue),
+  };
+}
+
+function summarizeBusyHour({ time, hour, minute, busynessPercent }) {
+  return { time, hour, minute, busynessPercent };
+}
+
+function derivePeakHoursFromBreakdown(popularTimes) {
+  const peakValue = popularTimes.overallPeak?.[0]?.busynessPercent;
+  if (peakValue == null) return [];
+  return popularTimes.days.flatMap((day) => day.hours
+    .filter(({ busynessPercent }) => busynessPercent === peakValue)
+    .map(({ label }) => `${day.day}: ${label}`));
+}
+
 function toCsv(items) {
   const columns = [
     'name', 'category', 'rating', 'reviewCount', 'priceLevel', 'address', 'phone',
-    'website', 'plusCode', 'menu', 'photos', 'photoScrape', 'openingHours', 'peakHours', 'about', 'contact',
+    'website', 'plusCode', 'menu', 'photos', 'photoScrape', 'openingHours', 'popularTimes', 'peakHours', 'about', 'contact',
     'latitude', 'longitude', 'googleMapsUrl', 'query', 'area',
     'scrapedAt',
   ];
