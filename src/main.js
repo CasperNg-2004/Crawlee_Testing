@@ -7,6 +7,7 @@ import {
   createPlaywrightRouter,
   log,
 } from 'crawlee';
+import { classifyMalaysiaBrand, loadMalaysiaBrandCatalog } from './brand-classifier.js';
 
 // PowerShell truncates Format-Table output to the terminal width on Windows.
 // Crawlee expects the complete `WorkingSetSize` process-list header.
@@ -24,6 +25,10 @@ const scrollWaitMs = positiveInteger(process.env.SCROLL_WAIT_MS, 2_000);
 const headless = process.env.HEADLESS?.toLowerCase() !== 'false';
 const outputDir = process.env.OUTPUT_DIR?.trim() || 'output';
 const chromeProfileDir = resolve(process.env.CHROME_PROFILE_DIR?.trim() || '.chrome-profile');
+const brandCatalogPath = resolve(
+  process.env.CHAIN_CLASSIFICATION_CATALOG?.trim() || 'config/malaysia-chain-counts.json',
+);
+const brandCatalog = await loadMalaysiaBrandCatalog(brandCatalogPath);
 const areas = (process.env.AREAS?.trim() || area)
   .split('|')
   .map((value) => value.trim())
@@ -177,7 +182,6 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
   }
 
   const canonicalUrl = page.url();
-  const coordinates = coordinatesFromUrl(canonicalUrl);
   const details = await page.evaluate(() => {
     const clean = (value) => value?.replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim() || null;
     const unique = (values) => [...new Set(values.filter(Boolean))];
@@ -214,7 +218,6 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
       address: stripLabel(itemText('address'), ['Address']),
       phone: stripLabel(itemText('phone'), ['Phone']),
       website: websiteElement?.href || null,
-      plusCode: stripLabel(itemText('oloc'), ['Plus code']),
       openingHours: hours,
       popularTimeLabels,
     };
@@ -242,24 +245,31 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
     photoResult.photoScrape.requestAttempts = request.retryCount + 1;
   }
 
+  const { phone, website } = details;
+  const brandClassification = classifyMalaysiaBrand(details, brandCatalog);
   const record = {
-    ...details,
+    name: details.name,
+    rating: details.rating,
+    area: request.userData.area,
+    category: details.category,
+    brandSize: brandClassification.brandSize,
+    numberOfOutlets: brandClassification.numberOfOutlets,
+    address: details.address,
+    contact: {
+      phone,
+      website,
+    },
+    reviewCount: details.reviewCount,
+    priceLevel: details.priceLevel,
+    openingHours: details.openingHours,
     menu,
-    photos: photoResult.photos,
-    photoScrape: photoResult.photoScrape,
     popularTimes,
     peakHours,
-    about,
-    contact: {
-      phone: details.phone,
-      website: details.website,
-      address: details.address,
-    },
-    latitude: coordinates?.latitude ?? null,
-    longitude: coordinates?.longitude ?? null,
-    googleMapsUrl: canonicalUrl,
     query: request.userData.query,
-    area: request.userData.area,
+    about,
+    photos: photoResult.photos,
+    photoScrape: photoResult.photoScrape,
+    googleMapsUrl: canonicalUrl,
     scrapedAt: new Date().toISOString(),
   };
 
@@ -274,8 +284,8 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
       reviewCount: record.reviewCount,
       address: record.address,
       searchArea: record.area,
-      phone: record.phone,
-      website: record.website,
+      phone: record.contact.phone,
+      website: record.contact.website,
       menuItemCount: countMenuItems(record.menu),
       photoCount: record.photos?.length ?? 0,
       photoScrapeStatus: record.photoScrape?.status ?? null,
@@ -375,6 +385,7 @@ if (directPlaceUrls.length) {
   );
 }
 log.info(`Using the dedicated Chrome profile at ${chromeProfileDir}. Run \`npm run login\` if Maps requests sign-in.`);
+log.info(`Loaded ${brandCatalog.length} Malaysia brand-count catalog entr${brandCatalog.length === 1 ? 'y' : 'ies'}.`);
 log.info(`Keeping one Chrome session for up to ${browserPageBudget} page uses to avoid profile-lock relaunches.`);
 if (maxRequestsPerCrawl) {
   log.info(`This process will stop cleanly after at most ${maxRequestsPerCrawl} requests for controlled batching.`);
@@ -1226,13 +1237,6 @@ function extractGooglePhotoUrls(body) {
   return [...photos.values()];
 }
 
-function coordinatesFromUrl(url) {
-  const match = url.match(/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/)
-    || url.match(/!3d(-?\d+(?:\.\d+)?)[^!]*!4d(-?\d+(?:\.\d+)?)/);
-  if (!match) return null;
-  return { latitude: Number(match[1]), longitude: Number(match[2]) };
-}
-
 function positiveInteger(value, fallback) {
   const number = Number.parseInt(value ?? '', 10);
   return Number.isInteger(number) && number > 0 ? number : fallback;
@@ -1369,10 +1373,10 @@ function derivePeakHoursFromBreakdown(popularTimes) {
 
 function toCsv(items) {
   const columns = [
-    'name', 'category', 'rating', 'reviewCount', 'priceLevel', 'address', 'phone',
-    'website', 'plusCode', 'menu', 'photos', 'photoScrape', 'openingHours', 'popularTimes', 'peakHours', 'about', 'contact',
-    'latitude', 'longitude', 'googleMapsUrl', 'query', 'area',
-    'scrapedAt',
+    'name', 'rating', 'area', 'category', 'brandSize', 'numberOfOutlets',
+    'address', 'contact', 'reviewCount', 'priceLevel', 'openingHours', 'menu',
+    'popularTimes', 'peakHours', 'query', 'about', 'photos', 'photoScrape',
+    'googleMapsUrl', 'scrapedAt',
   ];
   const escape = (value) => {
     const string = value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value);

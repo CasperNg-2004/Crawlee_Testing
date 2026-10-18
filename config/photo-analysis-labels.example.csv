@@ -1,0 +1,2 @@
+restaurantName,photoId,imageUrl,predictedCategory,confidence,actualCategory,expectedOcrText
+Example Cafe,example-photo-id,https://example.com/photo.jpg,menu,0.87,menu,"Iced Latte RM 12.00"

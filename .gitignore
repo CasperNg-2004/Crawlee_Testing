@@ -6,4 +6,5 @@ storage-*/
 .env
 google-auth-state.json
 .chrome-profile/
+.cache/
 *.log

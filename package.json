@@ -10,12 +10,20 @@
     "start:safe": "node --env-file=.env src/safe-run.js",
     "resume:safe": "node --env-file=.env src/safe-run.js --resume",
     "start:visible": "cross-env HEADLESS=false node --env-file=.env src/main.js",
-    "recon:reviews": "node --env-file=.env src/recon-reviews.js"
+    "recon:reviews": "node --env-file=.env src/recon-reviews.js",
+    "classify:chains": "node --env-file=.env src/classify-chains.js",
+    "analyze:photos": "node --env-file=.env src/analyze-photos.js",
+    "analyze:photos:resume": "node --env-file=.env src/analyze-photos.js --resume",
+    "analyze:photos:evaluate": "node --env-file=.env src/analyze-photos.js --evaluate-only",
+    "label:photos": "node --env-file=.env src/label-photos.js"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
     "crawlee": "^3.15.0",
     "cross-env": "^10.0.0",
-    "playwright": "^1.55.0"
+    "playwright": "^1.55.0",
+    "sharp": "^0.35.5",
+    "tesseract.js": "^7.0.0"
   },
   "engines": {
     "node": ">=20"
