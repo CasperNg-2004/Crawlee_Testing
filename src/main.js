@@ -1,25 +1,69 @@
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import {
   PlaywrightCrawler,
   Dataset,
+  KeyValueStore,
+  NonRetryableError,
   RequestQueue,
   createPlaywrightRouter,
   log,
 } from 'crawlee';
 import { classifyMalaysiaBrand, loadMalaysiaBrandCatalog } from './brand-classifier.js';
+import {
+  extractGooglePlaceMetadata,
+  extractGooglePlaceMetadataFromText,
+  googlePlaceIdentity,
+  normalizeGooglePlaceInput,
+  selectBestGooglePlaceUrl,
+} from './google-place.js';
+import { cleanMenuDescription } from './menu-utils.js';
+import {
+  normalizePhotoTabName,
+  parseGoogleUploadDate,
+  photoDateRank,
+} from './photo-utils.js';
+import { extractGoogleReviews, normalizeReviewSort } from './review-scraper.js';
+import { classifyGoogleSafetyState, isSuspiciousEmptyMenu } from './safety.js';
+
+let runSummaryPrinted = false;
+process.on('uncaughtException', (error) => {
+  if (!runSummaryPrinted) {
+    runSummaryPrinted = true;
+    console.error(error);
+    console.log(`RUN_SUMMARY ${JSON.stringify({
+      status: 'failed',
+      exitCode: 1,
+      succeeded: null,
+      failed: null,
+      safetyStop: null,
+      error: error?.message || String(error),
+      outputDir: process.env.OUTPUT_DIR?.trim() || 'output',
+    })}`);
+  }
+  process.exit(1);
+});
 
 // PowerShell truncates Format-Table output to the terminal width on Windows.
 // Crawlee expects the complete `WorkingSetSize` process-list header.
 if (process.platform === 'win32') process.env.COLUMNS = '200';
 
 const query = process.env.QUERY?.trim() || 'restaurant';
+const onePlaceArgumentIndex = process.argv.indexOf('--one-place');
+const onePlaceArgument = onePlaceArgumentIndex >= 0
+  ? process.argv[onePlaceArgumentIndex + 1]?.trim()
+  : null;
+const onePlaceInput = onePlaceArgument || process.env.ONE_PLACE?.trim() || null;
+const onePlaceMode = onePlaceArgumentIndex >= 0 || Boolean(process.env.ONE_PLACE?.trim());
+if (onePlaceMode && !onePlaceInput) {
+  throw new Error('One-place mode requires a ChIJ place ID or Google Maps URL after --one-place or in ONE_PLACE.');
+}
 const queries = (process.env.QUERIES?.trim() || query)
   .split('|')
   .map((value) => value.trim())
   .filter(Boolean);
 const area = process.env.AREA?.trim() || 'Kuala Lumpur, Malaysia';
-const maxPlaces = positiveInteger(process.env.MAX_PLACES, 1000);
+const maxPlaces = onePlaceMode ? 1 : positiveInteger(process.env.MAX_PLACES, 1000);
 const maxStalledScrolls = positiveInteger(process.env.MAX_STALLED_SCROLLS, 12);
 const scrollWaitMs = positiveInteger(process.env.SCROLL_WAIT_MS, 2_000);
 const headless = process.env.HEADLESS?.toLowerCase() !== 'false';
@@ -40,21 +84,55 @@ const searchTargets = queries.flatMap((searchQuery) => areas.map((searchArea) =>
 })));
 const maxCandidatesPerArea = positiveInteger(process.env.MAX_CANDIDATES_PER_AREA, 150);
 const scrapePhotos = booleanValue(process.env.SCRAPE_PHOTOS, false);
-const photoTabs = (process.env.PHOTO_TABS?.trim() || 'All|Menu|By owner')
+const photoTabs = (process.env.PHOTO_TABS?.trim() || 'Menu|By owner|All|Food & drink|Vibe')
   .split('|')
   .map((value) => value.trim())
   .filter(Boolean);
 const photoMaxPerPlace = positiveInteger(process.env.PHOTO_MAX_PER_PLACE, 30);
-const photoScanLimit = Math.max(
-  photoMaxPerPlace,
-  positiveInteger(process.env.PHOTO_SCAN_LIMIT, photoMaxPerPlace),
-);
+const photoScanLimit = positiveInteger(process.env.PHOTO_SCAN_LIMIT, 30);
+const photoTabLimits = new Map([
+  ['menu', positiveInteger(process.env.PHOTO_LIMIT_MENU, 8)],
+  ['by owner', positiveInteger(process.env.PHOTO_LIMIT_BY_OWNER, 4)],
+  ['all', positiveInteger(process.env.PHOTO_LIMIT_ALL, 30)],
+  ['food & drink', positiveInteger(process.env.PHOTO_LIMIT_FOOD_DRINK, 8)],
+  ['vibe', positiveInteger(process.env.PHOTO_LIMIT_VIBE, 3)],
+]);
 const photoScrollRounds = positiveInteger(process.env.PHOTO_SCROLL_ROUNDS, 120);
 const photoCaptureUploadDate = booleanValue(process.env.PHOTO_CAPTURE_UPLOAD_DATE, true);
-const directPlaceUrls = (process.env.PLACE_URLS?.trim() || '')
+const photoDateBatchSize = positiveInteger(process.env.PHOTO_DATE_BATCH_SIZE, 10);
+const photoDateConcurrency = positiveInteger(process.env.PHOTO_DATE_CONCURRENCY, 1);
+const photoDateWaitMs = positiveInteger(process.env.PHOTO_DATE_WAIT_MS, 300);
+const photoProbeConcurrency = positiveInteger(process.env.PHOTO_PROBE_CONCURRENCY, 2);
+const photoDebug = booleanValue(process.env.PHOTO_DEBUG, false);
+const scrapeReviews = booleanValue(process.env.SCRAPE_REVIEWS, true);
+const reviewMaxPerPlace = positiveInteger(process.env.REVIEW_MAX_PER_PLACE, 50);
+const reviewScrollRounds = positiveInteger(process.env.REVIEW_SCROLL_ROUNDS, 100);
+const reviewScrollWaitMs = positiveInteger(process.env.REVIEW_SCROLL_WAIT_MS, 250);
+const reviewSort = normalizeReviewSort(process.env.REVIEW_SORT || 'newest');
+const menuMaxAttempts = positiveInteger(process.env.MENU_MAX_ATTEMPTS, 2);
+const menuScrollMaxRounds = positiveInteger(process.env.MENU_SCROLL_MAX_ROUNDS, 80);
+const menuScrollWaitMs = positiveInteger(process.env.MENU_SCROLL_WAIT_MS, 350);
+const maxConsecutiveEmptyMenus = positiveInteger(
+  process.env.MAX_CONSECUTIVE_EMPTY_MENUS, 3,
+);
+const requireGoogleSignIn = booleanValue(process.env.REQUIRE_GOOGLE_SIGN_IN, true);
+const emptyMenuSafetyStateKey = 'EMPTY_MENU_SAFETY_STATE_V1';
+const isResumedStorageRun = process.env.CRAWLEE_PURGE_ON_START === '0';
+const configuredPlaceIds = (process.env.PLACE_IDS?.trim() || '')
   .split('|')
   .map((value) => value.trim())
   .filter(Boolean);
+const configuredPlaceUrls = (process.env.PLACE_URLS?.trim() || '')
+  .split('|')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const directPlaceInputs = onePlaceMode
+  ? [onePlaceInput]
+  : [...configuredPlaceIds, ...configuredPlaceUrls];
+const directPlaceUrls = [...new Map(directPlaceInputs.map((value) => {
+  const url = normalizeGooglePlaceInput(value, query);
+  return [googlePlaceIdentity(url), url];
+})).values()];
 const maxRequestsPerCrawl = positiveInteger(process.env.MAX_REQUESTS_PER_CRAWL, undefined);
 const maxRequestRetries = 2;
 const browserPageBudget = ((areas.length + maxPlaces) * (maxRequestRetries + 1)) + 100;
@@ -64,13 +142,19 @@ let queuedPlaceCount = 0;
 let successfulPlaceCount = 0;
 let failedPlaceCount = 0;
 let detailRequestsQueued = false;
+let fatalSafetyStop = null;
 const areaCandidates = new Map();
 const failedRestaurantRecords = [];
+const knownDetailRequests = new Map();
+const completedPlaceIdentities = new Set();
+const pendingEmptyMenuRecords = [];
+const knownQueueRequestIds = new Set();
 
 const router = createPlaywrightRouter();
 
 router.addHandler('SEARCH', async ({ page, request, log: requestLog }) => {
   await acceptConsentIfShown(page);
+  await enforceGoogleSafety(page, request);
 
   const feed = page.locator('div[role="feed"]');
   const placeUrls = new Set();
@@ -130,7 +214,14 @@ router.addHandler('SEARCH', async ({ page, request, log: requestLog }) => {
 
 router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog }) => {
   await acceptConsentIfShown(page);
-  await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
+  await enforceGoogleSafety(page, request);
+  try {
+    await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    await enforceGoogleSafety(page, request);
+    throw error;
+  }
+  await enforceGoogleSafety(page, request);
   const initialHeading = await page.locator('h1').first().innerText().catch(() => '');
   if (/can't reach the internet|something went wrong|no internet/i.test(initialHeading)) {
     throw new Error(`Google Maps error page: ${initialHeading}`);
@@ -181,9 +272,13 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
     }
   }
 
-  const canonicalUrl = page.url();
+  const canonicalUrl = await resolveGooglePlaceUrl(page, request.url, initialHeading);
+  const pageMetadata = await extractGooglePlaceMetadataFromLoadedPage(
+    page, request.url, initialHeading,
+  );
   const details = await page.evaluate(() => {
     const clean = (value) => value?.replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim() || null;
+    const main = document.querySelector('div[role="main"]') || document.body;
     const unique = (values) => [...new Set(values.filter(Boolean))];
     const text = (selector) => clean(document.querySelector(selector)?.textContent);
     const aria = (selector) => clean(document.querySelector(selector)?.getAttribute('aria-label'));
@@ -212,9 +307,17 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
       /popular times|usually.+busy|currently.+busy|as busy as it gets|\b\d{1,3}% busy\b/i.test(label),
     ));
 
+    const pageText = clean(main.innerText) || '';
+    const businessStatus = /\bpermanently closed\b/i.test(pageText)
+      ? 'permanently_closed'
+      : /\btemporarily closed\b/i.test(pageText)
+        ? 'temporarily_closed'
+        : 'open';
+
     return {
       name: text('h1'),
       category,
+      businessStatus,
       address: stripLabel(itemText('address'), ['Address']),
       phone: stripLabel(itemText('phone'), ['Phone']),
       website: websiteElement?.href || null,
@@ -229,10 +332,35 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
     ? derivePeakHoursFromBreakdown(popularTimes)
     : derivePeakHours(details.popularTimeLabels);
   delete details.popularTimeLabels;
-  const menu = await extractGoogleMenu(page);
+  const menuResult = await extractGoogleMenu(page);
   const about = await extractAbout(page);
+  let reviewTaskPromise = null;
+  const startReviewTask = () => {
+    if (!reviewTaskPromise) {
+      reviewTaskPromise = extractGoogleReviews(page, {
+        name: details.name,
+        googleMapsUrl: canonicalUrl,
+        reviewCount: details.reviewCount,
+      }, {
+        maxReviews: reviewMaxPerPlace,
+        maxScrollRounds: reviewScrollRounds,
+        scrollWaitMs: reviewScrollWaitMs,
+        sort: reviewSort,
+        safetyCheck: async () => enforceGoogleSafety(page, request),
+      }).then(
+        (result) => ({ result, error: null }),
+        (error) => ({ result: null, error }),
+      );
+    }
+    return reviewTaskPromise;
+  };
   const photoResult = scrapePhotos
-    ? await extractGooglePhotos(page, canonicalUrl, requestLog)
+    ? await extractGooglePhotos(
+      page,
+      canonicalUrl,
+      requestLog,
+      scrapeReviews ? startReviewTask : null,
+    )
     : { photos: null, photoScrape: null };
   if (photoResult.photoScrape?.status === 'failed' && request.retryCount < maxRequestRetries) {
     const failedTabs = Object.entries(photoResult.photoScrape.tabs)
@@ -244,14 +372,36 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
   if (photoResult.photoScrape) {
     photoResult.photoScrape.requestAttempts = request.retryCount + 1;
   }
+  let reviewResult = { reviews: null, reviewScrape: null };
+  if (scrapeReviews) {
+    const reviewTask = await startReviewTask();
+    if (reviewTask.error) throw reviewTask.error;
+    reviewResult = reviewTask.result;
+  }
+  if (reviewResult.reviewScrape) {
+    reviewResult.reviewScrape.requestAttempts = request.retryCount + 1;
+  }
 
   const { phone, website } = details;
   const brandClassification = classifyMalaysiaBrand(details, brandCatalog);
+  const canonicalMetadata = extractGooglePlaceMetadata(canonicalUrl);
+  const requestedMetadata = extractGooglePlaceMetadata(request.url);
+  const placeMetadata = {
+    placeId: canonicalMetadata.placeId ?? pageMetadata.placeId ?? requestedMetadata.placeId,
+    featureId: canonicalMetadata.featureId ?? pageMetadata.featureId ?? requestedMetadata.featureId,
+    latitude: canonicalMetadata.latitude ?? pageMetadata.latitude ?? requestedMetadata.latitude,
+    longitude: canonicalMetadata.longitude ?? pageMetadata.longitude ?? requestedMetadata.longitude,
+  };
   const record = {
     name: details.name,
+    placeId: placeMetadata.placeId,
+    featureId: placeMetadata.featureId,
+    latitude: placeMetadata.latitude,
+    longitude: placeMetadata.longitude,
     rating: details.rating,
     area: request.userData.area,
     category: details.category,
+    businessStatus: details.businessStatus,
     brandSize: brandClassification.brandSize,
     numberOfOutlets: brandClassification.numberOfOutlets,
     address: details.address,
@@ -262,18 +412,41 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
     reviewCount: details.reviewCount,
     priceLevel: details.priceLevel,
     openingHours: details.openingHours,
-    menu,
+    menu: menuResult.menu,
+    menuScrape: menuResult.menuScrape,
     popularTimes,
     peakHours,
     query: request.userData.query,
     about,
     photos: photoResult.photos,
     photoScrape: photoResult.photoScrape,
+    reviews: reviewResult.reviews,
+    reviewScrape: reviewResult.reviewScrape,
     googleMapsUrl: canonicalUrl,
     scrapedAt: new Date().toISOString(),
   };
 
+  if (isSuspiciousEmptyMenu(record.menuScrape)) {
+    pendingEmptyMenuRecords.push({
+      record,
+      requestUrl: request.url,
+      userData: { ...request.userData },
+      attempts: request.retryCount + 1,
+    });
+    await persistPendingEmptyMenuRecords();
+    requestLog.warning(
+      `Menu tab loaded with 0 typed items (${pendingEmptyMenuRecords.length}/${maxConsecutiveEmptyMenus} consecutive).`,
+    );
+    if (pendingEmptyMenuRecords.length >= maxConsecutiveEmptyMenus) {
+      await stopForConsecutiveEmptyMenus(request);
+    }
+    return;
+  }
+
+  await flushPendingEmptyMenuRecords(requestLog);
+  clearPreviousFailure(record);
   await pushData(record);
+  markRecordCompleted(record, request.url);
   successfulPlaceCount += 1;
   const elapsedMs = Date.now() - (request.userData.startedAt ?? Date.now());
   requestLog.info(
@@ -287,8 +460,11 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
       phone: record.contact.phone,
       website: record.contact.website,
       menuItemCount: countMenuItems(record.menu),
+      menuScrapeStatus: record.menuScrape.status,
       photoCount: record.photos?.length ?? 0,
       photoScrapeStatus: record.photoScrape?.status ?? null,
+      scrapedReviewCount: record.reviews?.length ?? 0,
+      reviewScrapeStatus: record.reviewScrape?.status ?? null,
       openingHours: record.openingHours,
       peakHours: record.peakHours,
       popularTimesSummary: record.popularTimes ? {
@@ -302,7 +478,9 @@ router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog })
   );
 });
 
+const requestQueue = await RequestQueue.open();
 const crawler = new PlaywrightCrawler({
+  requestQueue,
   requestHandler: router,
   headless,
   launchContext: {
@@ -324,32 +502,28 @@ const crawler = new PlaywrightCrawler({
   // Photo galleries are memory-heavy and this scraper uses one persistent Chrome
   // profile. Keep photo runs single-page so Chrome is less likely to crash and
   // leave the profile locked during a Crawlee browser relaunch.
-  maxConcurrency: (directPlaceUrls.length || scrapePhotos) ? 1 : 2,
+  maxConcurrency: (directPlaceUrls.length || scrapePhotos || scrapeReviews) ? 1 : 2,
   maxRequestsPerCrawl,
   maxRequestRetries,
-  requestHandlerTimeoutSecs: scrapePhotos ? 900 : 180,
+  requestHandlerTimeoutSecs: scrapePhotos || scrapeReviews ? 900 : 180,
   navigationTimeoutSecs: 45,
   preNavigationHooks: [async ({ page, request }) => {
     request.userData.startedAt = Date.now();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-MY,en;q=0.9' });
   }],
-  failedRequestHandler: async ({ request, error, log: requestLog }) => {
+  failedRequestHandler: async ({ request, log: requestLog }, error) => {
     const elapsedMs = Date.now() - (request.userData.startedAt ?? Date.now());
     if (request.label === 'DETAIL') {
-      failedPlaceCount += 1;
-      failedRestaurantRecords.push({
-        googleMapsUrl: request.url,
-        query: request.userData.query ?? query,
-        area: request.userData.area ?? null,
-        status: 'failed',
-        stage: 'restaurant-page',
-        attempts: request.retryCount + 1,
-        error: error?.message || 'Request failed after all retries',
-        failedAt: new Date().toISOString(),
-      });
+      if (!fatalSafetyStop) await flushPendingEmptyMenuRecords(requestLog);
+      if (!request.userData.failureRecorded) {
+        recordFailedDetailRequest(request, error?.message || 'Request failed after all retries', {
+          stage: fatalSafetyStop ? 'safety-stop' : 'restaurant-page',
+          safetyStop: fatalSafetyStop,
+        });
+      }
     } else if (request.label === 'SEARCH') {
       areaCandidates.set(request.userData.searchKey, []);
-      await queueDetailsWhenDiscoveryComplete();
+      if (!fatalSafetyStop) await queueDetailsWhenDiscoveryComplete();
     }
     requestLog.error(`Failed after retries in ${formatDuration(elapsedMs)}: ${request.url}`, {
       label: request.label,
@@ -367,17 +541,20 @@ const searchRequests = searchTargets.map(({ key, query: searchQuery, area: searc
 }));
 
 const initialRequests = directPlaceUrls.length
-  ? directPlaceUrls.slice(0, maxPlaces).map((url, index) => ({
+  ? directPlaceUrls.slice(0, maxPlaces).map((url) => ({
     url,
     label: 'DETAIL',
-    uniqueKey: `direct-place:${index}:${url}`,
+    uniqueKey: googlePlaceIdentity(url),
     userData: { area: 'Direct input', query },
   }))
   : searchRequests;
+for (const request of initialRequests.filter(({ label }) => label === 'DETAIL')) {
+  knownDetailRequests.set(placeIdentity(request.url), request);
+}
 if (directPlaceUrls.length) {
   detailRequestsQueued = true;
   queuedPlaceCount = initialRequests.length;
-  log.info(`Scraping ${queuedPlaceCount} direct Google Maps place URL(s).`);
+  log.info(`Scraping ${queuedPlaceCount} direct Google Maps place input(s)${onePlaceMode ? ' in one-place mode' : ''}.`);
 } else {
   log.info(
     `Searching for ${queries.map((value) => `"${value}"`).join(', ')} across `
@@ -390,12 +567,39 @@ log.info(`Keeping one Chrome session for up to ${browserPageBudget} page uses to
 if (maxRequestsPerCrawl) {
   log.info(`This process will stop cleanly after at most ${maxRequestsPerCrawl} requests for controlled batching.`);
 }
-await crawler.run(initialRequests);
+await restoreRunProgress();
+await restorePendingEmptyMenuRecords();
+// Seed the complete input set directly into storage before starting the crawler.
+// Passing initialRequests to crawler.run() lets maxRequestsPerCrawl cap both
+// processing and initial queue insertion, which can silently discard direct
+// place IDs beyond the first safe-mode batch.
+await addRequestsToQueue(initialRequests);
+await rememberPendingQueueRequestIds();
+await crawler.run();
+await releasePendingQueueLocks();
+const requestQueueInfo = await requestQueue.getInfo();
+const pendingRequestCount = requestQueueInfo?.pendingRequestCount ?? 0;
+if (!fatalSafetyStop) {
+  if (pendingRequestCount > 0 && pendingEmptyMenuRecords.length > 0) {
+    await persistPendingEmptyMenuRecords();
+    log.info(
+      `Preserved ${pendingEmptyMenuRecords.length} pending empty-menu result(s) across the controlled restart.`,
+    );
+  } else {
+    await flushPendingEmptyMenuRecords();
+  }
+}
+const remainingSafetyFailures = appendRemainingSafetyFailures();
 
 const dataset = await Dataset.getData({ limit: maxPlaces });
 await mkdir(outputDir, { recursive: true });
-await writeFileAtomic(`${outputDir}/restaurants.json`, `${JSON.stringify(dataset.items, null, 2)}\n`);
-await writeFileAtomic(`${outputDir}/restaurants.csv`, toCsv(dataset.items));
+if (onePlaceMode) {
+  const onePlaceRecord = dataset.items[0] ?? failedRestaurantRecords[0] ?? null;
+  await writeFileAtomic(`${outputDir}/place.json`, `${JSON.stringify(onePlaceRecord, null, 2)}\n`);
+} else {
+  await writeFileAtomic(`${outputDir}/restaurants.json`, `${JSON.stringify(dataset.items, null, 2)}\n`);
+  await writeFileAtomic(`${outputDir}/restaurants.csv`, toCsv(dataset.items));
+}
 await writeFileAtomic(
   `${outputDir}/failed-restaurants.json`,
   `${JSON.stringify(failedRestaurantRecords, null, 2)}\n`,
@@ -403,12 +607,26 @@ await writeFileAtomic(
 log.info(
   `Finished in ${formatDuration(Date.now() - runStartedAt)}. `
   + `Scraped ${successfulPlaceCount}/${queuedPlaceCount} places successfully; ${failedPlaceCount} failed. `
-  + `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`,
+  + (onePlaceMode
+    ? `Exported the one-place result to ${outputDir}/place.json.`
+    : `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`),
 );
+const exitCode = fatalSafetyStop ? 2 : failedPlaceCount > 0 ? 1 : 0;
+const runStatus = fatalSafetyStop ? 'safety_stopped' : failedPlaceCount > 0 ? 'completed_with_failures' : 'success';
+runSummaryPrinted = true;
+console.log(`RUN_SUMMARY ${JSON.stringify({
+  status: runStatus,
+  exitCode,
+  succeeded: dataset.items.length,
+  failed: failedRestaurantRecords.length,
+  remainingMarkedFailed: remainingSafetyFailures,
+  safetyStop: fatalSafetyStop,
+  outputDir,
+})}`);
 
 // Crawlee leaves its Chrome version-probe child alive with persistent contexts on Windows.
 // All crawler teardown and output writes are complete here, so exit cleanly and release the profile.
-process.exit(0);
+process.exit(exitCode);
 
 async function writeFileAtomic(filePath, contents) {
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
@@ -431,11 +649,324 @@ async function acceptConsentIfShown(page) {
   }
 }
 
+async function detectGoogleSafetyIssue(page) {
+  const snapshot = await page.evaluate(() => {
+    const visible = (element) => {
+      const box = element?.getBoundingClientRect();
+      return Boolean(box && box.width > 0 && box.height > 0);
+    };
+    const controls = [...document.querySelectorAll('a, button')].filter(visible);
+    const signInVisible = controls.some((element) => {
+      const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+      const label = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      const href = element.getAttribute('href') || '';
+      return /^(sign in|log in)$/i.test(text) || /sign in/i.test(label)
+        || /accounts\.google\.[^/]+\/.*(?:signin|login)/i.test(href);
+    });
+    const accountVisible = [...document.querySelectorAll('[aria-label], img[alt]')]
+      .filter(visible)
+      .some((element) => /google account|account menu|profile picture/i.test(
+        `${element.getAttribute('aria-label') || ''} ${element.getAttribute('alt') || ''}`,
+      ));
+    const hasCaptcha = [...document.querySelectorAll('iframe, form, [id], [class]')]
+      .some((element) => /recaptcha|captcha/i.test(
+        `${element.getAttribute('src') || ''} ${element.id || ''} ${element.className || ''}`,
+      ));
+    return {
+      bodyText: document.body?.innerText || '',
+      signInVisible,
+      accountVisible,
+      hasCaptcha,
+    };
+  }).catch(() => null);
+  return classifyGoogleSafetyState(snapshot, { requireSignIn: requireGoogleSignIn });
+}
+
+async function enforceGoogleSafety(page, request) {
+  const issue = await detectGoogleSafetyIssue(page);
+  if (!issue) return;
+  await activateSafetyStop(issue, request);
+}
+
+async function activateSafetyStop(issue, request) {
+  if (!fatalSafetyStop) {
+    fatalSafetyStop = {
+      code: issue.code,
+      message: issue.message,
+      url: request.url,
+      detectedAt: new Date().toISOString(),
+    };
+    await failPendingEmptyMenuRecords(
+      `Safety stop ${issue.code}: ${issue.message}`,
+      'safety-stop-buffered-menu',
+    );
+    log.error(`Safety stop activated: ${issue.code} — ${issue.message}`);
+  }
+
+  request.noRetry = true;
+  request.userData.failureRecorded = completedPlaceIdentities.has(placeIdentity(request.url));
+  crawler.stop(`Safety stop: ${issue.code}`);
+  throw new NonRetryableError(`SAFETY_STOP[${issue.code}]: ${issue.message}`);
+}
+
+async function stopForConsecutiveEmptyMenus(request) {
+  await activateSafetyStop({
+    code: 'consecutive_empty_menus',
+    message: `${maxConsecutiveEmptyMenus} consecutive places had a Menu tab but 0 typed items.`,
+  }, request);
+}
+
+async function flushPendingEmptyMenuRecords(logger = log) {
+  if (!pendingEmptyMenuRecords.length) {
+    await clearPendingEmptyMenuState();
+    return;
+  }
+  const pending = pendingEmptyMenuRecords.splice(0);
+  for (const entry of pending) {
+    clearPreviousFailure(entry.record);
+    await Dataset.pushData(entry.record);
+    markRecordCompleted(entry.record, entry.requestUrl);
+    successfulPlaceCount += 1;
+  }
+  await clearPendingEmptyMenuState();
+  logger.info(`Confirmed and saved ${pending.length} place(s) with an empty typed menu.`);
+}
+
+async function failPendingEmptyMenuRecords(error, stage) {
+  const pending = pendingEmptyMenuRecords.splice(0);
+  for (const entry of pending) {
+    const identity = placeIdentity(entry.requestUrl);
+    if (completedPlaceIdentities.has(identity)) continue;
+    failedRestaurantRecords.push({
+      ...entry.record,
+      menu: null,
+      menuScrape: {
+        ...entry.record.menuScrape,
+        status: 'failed',
+        error,
+      },
+      status: 'failed',
+      stage,
+      attempts: entry.attempts,
+      error,
+      safetyStop: fatalSafetyStop,
+      failedAt: new Date().toISOString(),
+    });
+    completedPlaceIdentities.add(identity);
+    failedPlaceCount += 1;
+  }
+  await clearPendingEmptyMenuState();
+}
+
+async function restorePendingEmptyMenuRecords() {
+  if (!isResumedStorageRun) return;
+  const state = await KeyValueStore.getValue(emptyMenuSafetyStateKey);
+  if (!Array.isArray(state?.records) || state.records.length === 0) return;
+  pendingEmptyMenuRecords.push(...state.records);
+  log.info(
+    `Restored ${state.records.length} pending empty-menu result(s) from the previous safe-run process.`,
+  );
+}
+
+async function restoreRunProgress() {
+  if (!isResumedStorageRun) return;
+
+  const existingDataset = await Dataset.getData({ limit: maxPlaces });
+  for (const record of existingDataset.items) {
+    markRecordCompleted(record);
+  }
+  successfulPlaceCount = existingDataset.items.length;
+
+  try {
+    const priorFailures = JSON.parse(
+      await readFile(`${outputDir}/failed-restaurants.json`, 'utf8'),
+    );
+    if (Array.isArray(priorFailures)) {
+      for (const record of priorFailures) {
+        const identities = storedRecordIdentities(record);
+        if (identities.some((identity) => completedPlaceIdentities.has(identity))) continue;
+        failedRestaurantRecords.push(record);
+        markRecordCompleted(record);
+      }
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  failedPlaceCount = failedRestaurantRecords.length;
+
+  if (successfulPlaceCount || failedPlaceCount) {
+    log.info(
+      `Restored ${successfulPlaceCount} successful and ${failedPlaceCount} failed place result(s).`,
+    );
+  }
+}
+
+async function persistPendingEmptyMenuRecords() {
+  if (pendingEmptyMenuRecords.length === 0) {
+    await clearPendingEmptyMenuState();
+    return;
+  }
+  await KeyValueStore.setValue(emptyMenuSafetyStateKey, {
+    records: pendingEmptyMenuRecords,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+async function clearPendingEmptyMenuState() {
+  await KeyValueStore.setValue(emptyMenuSafetyStateKey, null);
+}
+
+function clearPreviousFailure(record) {
+  const identities = new Set(storedRecordIdentities(record));
+  if (!identities.size) return;
+  for (let index = failedRestaurantRecords.length - 1; index >= 0; index -= 1) {
+    const matches = storedRecordIdentities(failedRestaurantRecords[index])
+      .some((identity) => identities.has(identity));
+    if (!matches) continue;
+    failedRestaurantRecords.splice(index, 1);
+  }
+  failedPlaceCount = failedRestaurantRecords.length;
+  for (const identity of identities) completedPlaceIdentities.delete(identity);
+}
+
+function storedRecordIdentities(record) {
+  return [...new Set([
+    record?.placeId ? `place-id:${record.placeId}` : null,
+    record?.featureId ? `feature-id:${record.featureId}` : null,
+    record?.googleMapsUrl ? placeIdentity(record.googleMapsUrl) : null,
+  ].filter(Boolean))];
+}
+
+function markRecordCompleted(record, requestUrl = null) {
+  if (requestUrl) completedPlaceIdentities.add(placeIdentity(requestUrl));
+  for (const identity of storedRecordIdentities(record)) completedPlaceIdentities.add(identity);
+}
+
+function recordFailedDetailRequest(request, error, { stage, safetyStop = null, attempts } = {}) {
+  const identity = placeIdentity(request.url);
+  if (completedPlaceIdentities.has(identity)) return;
+  failedRestaurantRecords.push({
+    ...extractGooglePlaceMetadata(request.url),
+    googleMapsUrl: request.url,
+    query: request.userData.query ?? query,
+    area: request.userData.area ?? null,
+    businessStatus: null,
+    menu: null,
+    menuScrape: menuScrapeResult(
+      'failed', null, 0, 0, attempts ?? request.retryCount + 1,
+      'Place page failed before typed-menu collection completed.',
+    ),
+    status: 'failed',
+    stage: stage || 'restaurant-page',
+    attempts: attempts ?? request.retryCount + 1,
+    error,
+    safetyStop,
+    failedAt: new Date().toISOString(),
+  });
+  completedPlaceIdentities.add(identity);
+  failedPlaceCount += 1;
+}
+
+function appendRemainingSafetyFailures() {
+  if (!fatalSafetyStop) return 0;
+  let added = 0;
+  for (const request of knownDetailRequests.values()) {
+    const identity = placeIdentity(request.url);
+    if (completedPlaceIdentities.has(identity)) continue;
+    recordFailedDetailRequest(
+      { ...request, retryCount: -1, userData: request.userData || {} },
+      `Not attempted because the run stopped: ${fatalSafetyStop.message}`,
+      { stage: 'safety-stop-remaining', safetyStop: fatalSafetyStop, attempts: 0 },
+    );
+    added += 1;
+  }
+  return added;
+}
+
 function cleanPlaceUrl(url) {
   const parsed = new URL(url);
   parsed.search = '';
   parsed.hash = '';
   return parsed.toString();
+}
+
+async function resolveGooglePlaceUrl(page, requestedUrl, placeName) {
+  const candidates = await page.evaluate(() => {
+    const results = new Set([location.href]);
+    const add = (value) => {
+      if (!value) return;
+      try {
+        const url = new URL(value, location.href);
+        if (/(^|\.)google\.[a-z.]+$/i.test(url.hostname) && /^\/maps(?:\/|$)/i.test(url.pathname)) {
+          results.add(url.toString());
+        }
+      } catch {
+        // Ignore malformed page attributes; only valid Maps URLs are candidates.
+      }
+    };
+
+    add(document.querySelector('link[rel="canonical"]')?.getAttribute('href'));
+    add(document.querySelector('meta[property="og:url"]')?.getAttribute('content'));
+    add(document.querySelector('meta[itemprop="url"]')?.getAttribute('content'));
+    for (const element of document.querySelectorAll('a[href], [data-href], [data-url]')) {
+      add(element.getAttribute('href'));
+      add(element.getAttribute('data-href'));
+      add(element.getAttribute('data-url'));
+      if (results.size >= 500) break;
+    }
+    return [...results];
+  }).catch(() => [page.url()]);
+
+  return selectBestGooglePlaceUrl(candidates, requestedUrl, placeName);
+}
+
+async function extractGooglePlaceMetadataFromLoadedPage(page, requestedUrl, placeName) {
+  const requestedMetadata = extractGooglePlaceMetadata(requestedUrl);
+  const markers = [requestedMetadata.placeId, placeName].filter(Boolean);
+  const snippets = await page.evaluate((pageMarkers) => {
+    const sources = [document.documentElement.innerHTML];
+    for (const key of ['APP_INITIALIZATION_STATE', 'APP_OPTIONS']) {
+      try {
+        const serialized = JSON.stringify(globalThis[key]);
+        if (serialized) sources.push(serialized);
+      } catch {
+        // A missing or non-serializable Google page-state object is optional.
+      }
+    }
+
+    const results = [];
+    for (const source of sources) {
+      const lowerSource = source.toLowerCase();
+      for (const marker of pageMarkers) {
+        const lowerMarker = marker.toLowerCase();
+        let cursor = 0;
+        let matches = 0;
+        while (matches < 4 && results.length < 12) {
+          const index = lowerSource.indexOf(lowerMarker, cursor);
+          if (index < 0) break;
+          const start = Math.max(0, index - 200_000);
+          const end = Math.min(source.length, index + marker.length + 200_000);
+          results.push(source.slice(start, end));
+          cursor = index + marker.length;
+          matches += 1;
+        }
+      }
+    }
+    return results;
+  }, markers).catch(() => []);
+
+  const result = { ...requestedMetadata };
+  for (const snippet of snippets) {
+    const metadata = extractGooglePlaceMetadataFromText(
+      snippet, requestedMetadata.placeId || placeName,
+    );
+    if (!result.placeId && metadata.placeId) result.placeId = metadata.placeId;
+    if (!result.featureId && metadata.featureId) result.featureId = metadata.featureId;
+    if (result.latitude == null && metadata.latitude != null) result.latitude = metadata.latitude;
+    if (result.longitude == null && metadata.longitude != null) result.longitude = metadata.longitude;
+    if (result.featureId && result.latitude != null && result.longitude != null) break;
+  }
+  return result;
 }
 
 function buildSearchUrl(searchQuery, searchArea) {
@@ -447,6 +978,9 @@ async function queueDetailsWhenDiscoveryComplete() {
   detailRequestsQueued = true;
 
   const detailRequests = selectFairCandidates(areaCandidates, searchTargets, maxPlaces);
+  for (const request of detailRequests) {
+    knownDetailRequests.set(placeIdentity(request.url), request);
+  }
   queuedPlaceCount = detailRequests.length;
   logDiscoverySummary(areaCandidates, searchTargets, detailRequests);
   log.info(`Fair round-robin selection queued ${queuedPlaceCount} unique places for detail scraping.`);
@@ -457,8 +991,37 @@ async function queueDetailsWhenDiscoveryComplete() {
     // discarded every detail request beyond the first safe batch. Direct queue
     // insertion stores all selected places while the crawler still stops at
     // the process-level request limit.
-    const requestQueue = await RequestQueue.open();
-    await requestQueue.addRequests(detailRequests);
+    await addRequestsToQueue(detailRequests);
+  }
+}
+
+async function addRequestsToQueue(requests) {
+  const result = await requestQueue.addRequests(requests);
+  for (const item of result.processedRequests || []) {
+    if (item.requestId) knownQueueRequestIds.add(item.requestId);
+  }
+  return result;
+}
+
+async function rememberPendingQueueRequestIds() {
+  if (!maxRequestsPerCrawl) return;
+  const head = await requestQueue.client.listHead({
+    limit: Math.max(maxPlaces + searchTargets.length + 100, 1_000),
+  });
+  for (const item of head.items || []) knownQueueRequestIds.add(item.id);
+}
+
+async function releasePendingQueueLocks() {
+  if (!maxRequestsPerCrawl || knownQueueRequestIds.size === 0) return;
+  let released = 0;
+  for (const requestId of knownQueueRequestIds) {
+    const storedRequest = await requestQueue.client.getRequest(requestId).catch(() => null);
+    if (!storedRequest || storedRequest.handledAt) continue;
+    await requestQueue.client.deleteRequestLock(requestId).catch(() => {});
+    released += 1;
+  }
+  if (released > 0) {
+    log.info(`Released ${released} pending queue lock(s) for the next safe-run process.`);
   }
 }
 
@@ -506,13 +1069,7 @@ function selectFairCandidates(candidatesByTarget, targets, limit) {
 }
 
 function placeIdentity(url) {
-  const googlePlaceId = url.match(/!19s([^!/?]+)/)?.[1];
-  if (googlePlaceId) return `place-id:${decodeURIComponent(googlePlaceId)}`;
-
-  const dataId = url.match(/!1s([^!/?]+)/)?.[1];
-  if (dataId) return `data-id:${decodeURIComponent(dataId)}`;
-
-  return cleanPlaceUrl(url);
+  return googlePlaceIdentity(url);
 }
 
 function logDiscoverySummary(candidatesByTarget, targets, selectedRequests) {
@@ -543,32 +1100,85 @@ async function extractGoogleMenu(page) {
     }
   }
 
-  if (!menuTab) return null;
-
-  await menuTab.click().catch(() => {});
-  await menuTab.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {});
-  await page.waitForTimeout(1_250);
-
-  const panel = page.locator('div[role="main"]').first();
-  if (!await panel.isVisible().catch(() => false)) return null;
-  const categoryNames = await getMenuCategoryNames(page);
-  const categoriesToScrape = categoryNames.length ? categoryNames : [null];
-  const rawItems = [];
-
-  for (const categoryName of categoriesToScrape) {
-    if (categoryName) {
-      const clicked = await clickMenuCategory(page, categoryName);
-      if (!clicked) continue;
-      await page.waitForTimeout(400);
-    }
-
-    await scrollDetailsPanel(panel);
-    rawItems.push(...await extractVisibleMenuRows(panel, categoryName, categoryNames));
+  if (!menuTab) {
+    return {
+      menu: null,
+      menuScrape: menuScrapeResult('none', false, 0, 0, 1, null),
+    };
   }
 
-  const normalizedItems = rawItems
-    .map(normalizeMenuItem)
-    .filter(Boolean);
+  let lastError = null;
+  let bestMenu = null;
+  let bestItemCount = 0;
+  let bestCategoryCount = 0;
+
+  for (let attempt = 1; attempt <= menuMaxAttempts; attempt += 1) {
+    try {
+      await menuTab.click({ timeout: 5_000 });
+      await page.waitForTimeout(1_000);
+      if (!await waitForGoogleMenuRegion(page)) {
+        throw new Error('Menu tab opened but the typed Menu region did not load.');
+      }
+
+      const categoryNames = await getMenuCategoryNames(page);
+      const categoriesToScrape = categoryNames.length ? categoryNames : [null];
+      const rawItems = [];
+
+      for (const categoryName of categoriesToScrape) {
+        if (categoryName) {
+          const clicked = await clickMenuCategory(page, categoryName);
+          if (!clicked) throw new Error(`Menu category did not open: ${categoryName}`);
+          await page.waitForTimeout(400);
+        }
+
+        rawItems.push(...await collectGoogleMenuCategoryRows(page, categoryName, categoryNames));
+      }
+
+      const uniqueItems = normalizeAndMergeMenuItems(rawItems);
+      const menu = buildGoogleMenu(uniqueItems);
+      const itemCount = uniqueItems.length;
+      if (itemCount > bestItemCount) {
+        bestMenu = menu;
+        bestItemCount = itemCount;
+        bestCategoryCount = categoryNames.length;
+      }
+
+      if (itemCount > 0) {
+        return {
+          menu,
+          menuScrape: menuScrapeResult(
+            'success', true, itemCount, categoryNames.length, attempt, null,
+          ),
+        };
+      }
+
+      if (attempt === menuMaxAttempts) {
+        return {
+          menu: null,
+          menuScrape: menuScrapeResult('none', true, 0, categoryNames.length, attempt, null),
+        };
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt < menuMaxAttempts) await page.waitForTimeout(750);
+    }
+  }
+
+  return {
+    menu: bestMenu,
+    menuScrape: menuScrapeResult(
+      'failed', true, bestItemCount, bestCategoryCount, menuMaxAttempts,
+      lastError?.message || 'Unknown typed-menu failure',
+    ),
+  };
+}
+
+function menuScrapeResult(status, tabExists, itemCount, categoryCount, attempts, error) {
+  return { status, tabExists, itemCount, categoryCount, attempts, error };
+}
+
+function normalizeAndMergeMenuItems(rawItems) {
+  const normalizedItems = rawItems.map(normalizeMenuItem).filter(Boolean);
   const uniqueItems = [];
   const itemIndexes = new Map();
 
@@ -591,10 +1201,13 @@ async function extractGoogleMenu(page) {
     };
   }
 
-  if (!uniqueItems.length) return null;
+  return uniqueItems;
+}
 
+function buildGoogleMenu(items) {
+  if (!items.length) return null;
   const sections = [];
-  for (const item of uniqueItems) {
+  for (const item of items) {
     let section = sections.find(({ name }) => name === item.section);
     if (!section) {
       section = { name: item.section, items: [] };
@@ -603,8 +1216,16 @@ async function extractGoogleMenu(page) {
     const { section: ignoredSection, ...dish } = item;
     section.items.push(dish);
   }
-
   return { source: 'google_maps', sections };
+}
+
+async function waitForGoogleMenuRegion(page) {
+  return page.waitForFunction(() => [...document.querySelectorAll('[role="region"][aria-label]')]
+    .some((element) => {
+      const box = element.getBoundingClientRect();
+      return /^menu$/i.test((element.getAttribute('aria-label') || '').trim())
+        && box.width > 0 && box.height > 0;
+    }), undefined, { timeout: 8_000 }).then(() => true).catch(() => false);
 }
 
 async function getMenuCategoryNames(page) {
@@ -664,20 +1285,84 @@ async function clickMenuCategory(page, categoryName) {
   return false;
 }
 
-async function scrollDetailsPanel(panel) {
-  let previousHeight = 0;
+async function collectGoogleMenuCategoryRows(page, categoryName, categoryNames) {
+  const rowsByKey = new Map();
   let stalledRounds = 0;
-  while (stalledRounds < 3) {
-    const height = await panel.evaluate((element) => element.scrollHeight).catch(() => previousHeight);
-    await panel.evaluate((element) => element.scrollTo(0, element.scrollHeight)).catch(() => {});
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 400));
-    stalledRounds = height === previousHeight ? stalledRounds + 1 : 0;
-    previousHeight = height;
+  await scrollGoogleMenuRegion(page, true);
+
+  for (let round = 0; round < menuScrollMaxRounds; round += 1) {
+    const before = rowsByKey.size;
+    const visibleRows = await extractVisibleMenuRows(page, categoryName, categoryNames);
+    for (const row of visibleRows) {
+      const key = `${row.name || ''}\u0000${row.displayedPrice || ''}\u0000${row.description || ''}`;
+      if (!rowsByKey.has(key)) rowsByKey.set(key, row);
+    }
+
+    stalledRounds = rowsByKey.size === before ? stalledRounds + 1 : 0;
+    const scroll = await scrollGoogleMenuRegion(page, false);
+    if (scroll.atBottom && stalledRounds >= 3) break;
+    await page.waitForTimeout(menuScrollWaitMs);
   }
+
+  // Read the final viewport once more because a scroll can trigger the last
+  // virtualized batch immediately before the at-bottom condition is reached.
+  for (const row of await extractVisibleMenuRows(page, categoryName, categoryNames)) {
+    const key = `${row.name || ''}\u0000${row.displayedPrice || ''}\u0000${row.description || ''}`;
+    if (!rowsByKey.has(key)) rowsByKey.set(key, row);
+  }
+  return [...rowsByKey.values()];
 }
 
-async function extractVisibleMenuRows(panel, categoryName, categoryNames) {
-  return panel.evaluate((main, input) => {
+async function scrollGoogleMenuRegion(page, reset) {
+  return page.evaluate((shouldReset) => {
+    const visible = (element) => {
+      const box = element?.getBoundingClientRect();
+      return Boolean(box && box.width > 0 && box.height > 0);
+    };
+    const region = [...document.querySelectorAll('[role="region"][aria-label]')]
+      .find((element) => /^menu$/i.test((element.getAttribute('aria-label') || '').trim())
+        && visible(element));
+    if (!region) return { found: false, atBottom: false, moved: false };
+
+    const candidates = [region, ...region.querySelectorAll('*')];
+    let ancestor = region.parentElement;
+    while (ancestor && ancestor !== document.body) {
+      candidates.push(ancestor);
+      if (ancestor.getAttribute('role') === 'main') break;
+      ancestor = ancestor.parentElement;
+    }
+
+    const scrollable = [...new Set(candidates)]
+      .filter((element) => visible(element)
+        && element.clientHeight >= 100
+        && element.scrollHeight > element.clientHeight + 20)
+      .sort((left, right) => {
+        const leftStyle = getComputedStyle(left).overflowY;
+        const rightStyle = getComputedStyle(right).overflowY;
+        const leftScore = /auto|scroll/.test(leftStyle) ? 1 : 0;
+        const rightScore = /auto|scroll/.test(rightStyle) ? 1 : 0;
+        return rightScore - leftScore
+          || (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight);
+      })[0];
+
+    if (!scrollable) return { found: false, atBottom: true, moved: false };
+    const before = scrollable.scrollTop;
+    if (shouldReset) scrollable.scrollTo(0, 0);
+    else scrollable.scrollBy(0, Math.max(Math.floor(scrollable.clientHeight * 0.8), 450));
+    const after = scrollable.scrollTop;
+    return {
+      found: true,
+      moved: after !== before,
+      scrollTop: after,
+      scrollHeight: scrollable.scrollHeight,
+      clientHeight: scrollable.clientHeight,
+      atBottom: after + scrollable.clientHeight >= scrollable.scrollHeight - 5,
+    };
+  }, reset);
+}
+
+async function extractVisibleMenuRows(page, categoryName, categoryNames) {
+  return page.evaluate((input) => {
     const clean = (value) => value?.replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim() || null;
     const linesOf = (element) => (element.innerText || '')
       .split(/\n+/)
@@ -685,7 +1370,7 @@ async function extractVisibleMenuRows(panel, categoryName, categoryNames) {
       .filter(Boolean);
     const ignored = /^(overview|menu|about|reviews?|photos?|order online|directions|save|nearby|share|popular|secure your spot)$/i;
     const ignoredCategories = new Set(input.categoryNames.map((name) => name.toLowerCase()));
-    const menuRegion = [...main.querySelectorAll('[role="region"][aria-label]')]
+    const menuRegion = [...document.querySelectorAll('[role="region"][aria-label]')]
       .find((element) => /^menu$/i.test(clean(element.getAttribute('aria-label')) || ''));
     if (!menuRegion) return [];
 
@@ -738,7 +1423,7 @@ function normalizeMenuItem(rawItem) {
   return {
     section: rawItem.section || null,
     name,
-    description: rawItem.description || inferredDescription,
+    description: cleanMenuDescription(rawItem.description || inferredDescription, price.priceText),
     priceText: price.priceText,
     priceValue: price.priceValue,
     currency: price.currency,
@@ -860,67 +1545,213 @@ async function extractAbout(page) {
   });
 }
 
-async function extractGooglePhotos(page, canonicalUrl, requestLog) {
+async function extractGooglePhotos(page, canonicalUrl, requestLog, backgroundTask = null) {
+  const totalStartedAt = Date.now();
   const photosById = new Map();
-  const tabResults = {};
+  const tabResultsByName = new Map();
+  const photoDatesById = new Map();
+  let backgroundTaskPromise = null;
+  const startBackgroundTask = () => {
+    if (!backgroundTaskPromise && backgroundTask) backgroundTaskPromise = backgroundTask();
+  };
+  const processingTabs = [...photoTabs].sort((left, right) => {
+    const leftIsAll = normalizePhotoTabName(left) === 'all';
+    const rightIsAll = normalizePhotoTabName(right) === 'all';
+    return Number(rightIsAll) - Number(leftIsAll);
+  });
 
-  for (const tab of photoTabs) {
-    const tabResult = await collectGooglePhotoTab(page, canonicalUrl, tab);
-    tabResults[tab] = {
+  for (const tab of processingTabs) {
+    const tabStartedAt = Date.now();
+    const limit = photoLimitForTab(tab);
+    const scanLimit = Math.max(limit, photoScanLimit);
+    const discoveryStartedAt = Date.now();
+    const tabResult = await collectGooglePhotoTab(page, canonicalUrl, tab, scanLimit);
+    const discoveryDurationMs = Date.now() - discoveryStartedAt;
+    let datedPhotos = tabResult.photos.map((photo) => ({
+      ...photo,
+      uploadDate: photoDatesById.get(photo.photoId) ?? null,
+    }));
+    const reusedUploadDates = datedPhotos.filter(({ uploadDate }) => uploadDate).length;
+    let newlyCapturedUploadDates = 0;
+    let dateDurationMs = 0;
+    let dateError = null;
+    let uploadDateRetryAttempts = 0;
+    let uploadDatesRecoveredByRetry = 0;
+    let uploadDateRetryError = null;
+
+    if (tabResult.status === 'success' && photoCaptureUploadDate) {
+      const orderedPhotos = datedPhotos
+        .filter((photo) => photo.discoverySource === 'dom' && !photo.uploadDate)
+        .sort((left, right) => (left.photoIndex ?? Number.MAX_SAFE_INTEGER)
+          - (right.photoIndex ?? Number.MAX_SAFE_INTEGER))
+        .map(({ photoId, photoIndex }) => ({ photoId, photoIndex }));
+      const dateStartedAt = Date.now();
+      try {
+        const datesById = await collectGooglePhotoDates(
+          page,
+          canonicalUrl,
+          tab,
+          orderedPhotos,
+          backgroundTaskPromise ? null : startBackgroundTask,
+        );
+        for (const [photoId, uploadDate] of datesById) {
+          if (!uploadDate) continue;
+          photoDatesById.set(photoId, uploadDate);
+          newlyCapturedUploadDates += 1;
+        }
+        datedPhotos = datedPhotos.map((photo) => ({
+          ...photo,
+          uploadDate: photoDatesById.get(photo.photoId) ?? null,
+        }));
+      } catch (error) {
+        dateError = error.message;
+        requestLog.warning(`Photo upload dates failed for ${tab}: ${error.message}`);
+      } finally {
+        dateDurationMs = Date.now() - dateStartedAt;
+      }
+      // The background task uses the released main page while a short-lived
+      // upload-date page works. Wait before the next photo tab reuses main.
+      if (backgroundTaskPromise) await backgroundTaskPromise;
+    }
+
+    let selectedPhotos = datedPhotos
+      .map((photo, originalOrder) => ({ photo, originalOrder }))
+      .sort((left, right) => photoDateRank(right.photo.uploadDate)
+        - photoDateRank(left.photo.uploadDate)
+        || (left.photo.photoIndex ?? Number.MAX_SAFE_INTEGER)
+          - (right.photo.photoIndex ?? Number.MAX_SAFE_INTEGER)
+        || left.originalOrder - right.originalOrder)
+      .slice(0, limit)
+      .map(({ photo }) => photo);
+    if (tabResult.status === 'success' && photoCaptureUploadDate) {
+      const missingSelectedDates = selectedPhotos
+        .filter((photo) => photo.discoverySource === 'dom' && !photo.uploadDate)
+        .map(({ photoId, photoIndex }) => ({ photoId, photoIndex }));
+      if (missingSelectedDates.length) {
+        uploadDateRetryAttempts = 1;
+        const retryStartedAt = Date.now();
+        try {
+          const retryDatesById = await collectGooglePhotoDates(
+            page, canonicalUrl, tab, missingSelectedDates,
+          );
+          for (const [photoId, uploadDate] of retryDatesById) {
+            if (!uploadDate) continue;
+            if (!photoDatesById.has(photoId)) uploadDatesRecoveredByRetry += 1;
+            photoDatesById.set(photoId, uploadDate);
+          }
+          selectedPhotos = selectedPhotos.map((photo) => ({
+            ...photo,
+            uploadDate: photoDatesById.get(photo.photoId) ?? photo.uploadDate,
+          }));
+        } catch (error) {
+          uploadDateRetryError = error.message;
+          requestLog.warning(`Missing photo-date retry failed for ${tab}: ${error.message}`);
+        } finally {
+          dateDurationMs += Date.now() - retryStartedAt;
+        }
+      }
+    }
+    const uploadDatesCaptured = selectedPhotos.filter(({ uploadDate }) => uploadDate).length;
+    const metadataStatus = tabResult.status !== 'success'
+      ? tabResult.status
+      : !photoCaptureUploadDate
+        ? 'disabled'
+        : dateError || uploadDateRetryError || uploadDatesCaptured < selectedPhotos.length
+          ? 'partial'
+          : 'success';
+
+    tabResultsByName.set(tab, {
       status: tabResult.status,
       attempts: tabResult.attempts,
-      photoCount: tabResult.photos.length,
+      requestedLimit: limit,
+      discoveredPhotoCount: tabResult.photos.length,
+      photoCount: selectedPhotos.length,
+      uploadDatesCaptured,
+      uploadDatesReused: reusedUploadDates,
+      uploadDatesNewlyCaptured: newlyCapturedUploadDates,
+      uploadDateRetryAttempts,
+      uploadDatesRecoveredByRetry,
+      metadataStatus,
       error: tabResult.error,
-    };
-    for (const photo of tabResult.photos) {
+      metadataError: [dateError, uploadDateRetryError].filter(Boolean).join('; ') || null,
+      discoveryDurationMs,
+      uploadDateDurationMs: dateDurationMs,
+      durationMs: Date.now() - tabStartedAt,
+    });
+    for (const photo of selectedPhotos) {
       const existing = photosById.get(photo.photoId);
       if (existing) {
         if (!existing.tabs.includes(tab)) existing.tabs.push(tab);
-        if (existing.discoverySource === 'network' && photo.discoverySource === 'dom') {
-          existing.discoverySource = 'dom';
-          existing.sourceImageUrl = photo.sourceImageUrl;
-          existing.photoIndex = photo.photoIndex;
-        }
-      } else if (photosById.size < photoScanLimit) {
+        if (!existing.uploadDate && photo.uploadDate) existing.uploadDate = photo.uploadDate;
+      } else {
         photosById.set(photo.photoId, { ...photo, tabs: [tab] });
       }
     }
     requestLog.info(
-      `Photo tab ${tab}: status=${tabResult.status}, attempts=${tabResult.attempts}, photos=${tabResult.photos.length}.`,
+      `Photo tab ${tab}: status=${tabResult.status}, attempts=${tabResult.attempts}, `
+      + `selected=${selectedPhotos.length}/${limit}, discovered=${tabResult.photos.length}, `
+      + `dates=${uploadDatesCaptured}, reused=${reusedUploadDates}, `
+      + `new=${newlyCapturedUploadDates}, duration=${formatDuration(Date.now() - tabStartedAt)}.`,
     );
   }
 
+  const tabResults = Object.fromEntries(photoTabs
+    .map((tab) => [tab, tabResultsByName.get(tab)]));
   const candidates = [...photosById.values()];
-  const hasFailedTab = Object.values(tabResults).some(({ status }) => status === 'failed');
+  const tabStatuses = Object.values(tabResults).map(({ status }) => status);
+  const hasFailedTab = tabStatuses.some((status) => status === 'failed');
+  const allTabsFailed = tabStatuses.length > 0
+    && tabStatuses.every((status) => status === 'failed');
+  const hasPartialMetadata = Object.values(tabResults)
+    .some(({ metadataStatus }) => metadataStatus === 'partial');
   const photoScrape = {
-    status: hasFailedTab ? 'failed' : candidates.length ? 'success' : 'none',
+    status: allTabsFailed
+      ? 'failed'
+      : hasFailedTab || hasPartialMetadata
+        ? 'partial'
+        : candidates.length
+          ? 'success'
+          : 'none',
+    uploadDateCaptureEnabled: photoCaptureUploadDate,
+    photoCount: candidates.length,
     tabs: tabResults,
+    timing: {
+      fullSizeProbeDurationMs: 0,
+      totalDurationMs: 0,
+    },
   };
-  if (!candidates.length) return { photos: [], photoScrape };
-
-  if (photoCaptureUploadDate) {
-    const orderedAllPhotoIds = candidates
-      .filter((photo) => photo.tabs.includes('All') && photo.discoverySource === 'dom')
-      .sort((left, right) => (left.photoIndex ?? Number.MAX_SAFE_INTEGER)
-        - (right.photoIndex ?? Number.MAX_SAFE_INTEGER))
-      .map((photo) => photo.photoId);
-    const datesById = await collectGooglePhotoDates(page, canonicalUrl, orderedAllPhotoIds).catch((error) => {
-      requestLog.warning(`Photo upload dates could not be collected: ${error.message}`);
-      return new Map();
-    });
-    for (const photo of candidates) photo.uploadDate = datesById.get(photo.photoId) ?? null;
-  } else {
-    for (const photo of candidates) photo.uploadDate = null;
+  if (!candidates.length) {
+    photoScrape.timing.totalDurationMs = Date.now() - totalStartedAt;
+    return { photos: [], photoScrape };
   }
 
   const photos = candidates
     .map((photo, originalOrder) => ({ photo, originalOrder }))
     .sort((left, right) => photoDateRank(right.photo.uploadDate) - photoDateRank(left.photo.uploadDate)
       || left.originalOrder - right.originalOrder)
-    .slice(0, photoMaxPerPlace)
     .map(({ photo }) => photo);
 
+  const probeStartedAt = Date.now();
   const probes = await probeFullSizePhotos(page, photos);
+  const failedProbeIndexes = probes
+    .map((probe, index) => (!probe?.loaded || !probe.width || !probe.height ? index : null))
+    .filter((index) => index != null);
+  let fullSizeRetryAttempts = 0;
+  let fullSizeRecoveredByRetry = 0;
+  if (failedProbeIndexes.length) {
+    fullSizeRetryAttempts = 1;
+    const retryPhotos = failedProbeIndexes.map((index) => photos[index]);
+    await page.waitForTimeout(500);
+    const retryProbes = await probeFullSizePhotos(page, retryPhotos);
+    for (let retryIndex = 0; retryIndex < failedProbeIndexes.length; retryIndex += 1) {
+      const originalIndex = failedProbeIndexes[retryIndex];
+      const retryProbe = retryProbes[retryIndex];
+      if (!retryProbe?.loaded || !retryProbe.width || !retryProbe.height) continue;
+      probes[originalIndex] = retryProbe;
+      fullSizeRecoveredByRetry += 1;
+    }
+  }
+  photoScrape.timing.fullSizeProbeDurationMs = Date.now() - probeStartedAt;
   for (let index = 0; index < photos.length; index += 1) {
     const probe = probes[index];
     photos[index].fullSizeImageUrl = probe?.loaded ? probe.url : null;
@@ -929,14 +1760,55 @@ async function extractGooglePhotos(page, canonicalUrl, requestLog) {
     if (!probe?.loaded) photos[index].imageError = probe?.error || 'Full-size image did not load';
   }
 
+  const failedPhotoMetadata = photos
+    .filter((photo) => !photo.fullSizeImageUrl || !photo.width || !photo.height)
+    .map((photo) => ({
+      photoId: photo.photoId,
+      tabs: photo.tabs,
+      error: photo.imageError || 'Required full-size photo metadata is missing',
+    }));
+  photoScrape.fullSizeRetryAttempts = fullSizeRetryAttempts;
+  photoScrape.fullSizeRecoveredByRetry = fullSizeRecoveredByRetry;
+  photoScrape.failedPhotoMetadata = failedPhotoMetadata;
+  if (failedPhotoMetadata.length) {
+    if (photoScrape.status === 'success') photoScrape.status = 'partial';
+    for (const failure of failedPhotoMetadata) {
+      for (const tab of failure.tabs) {
+        const tabResult = photoScrape.tabs[tab];
+        if (!tabResult) continue;
+        tabResult.metadataStatus = 'partial';
+        tabResult.fullSizeMetadataStatus = 'partial';
+        tabResult.fullSizeFailedPhotoIds ??= [];
+        if (!tabResult.fullSizeFailedPhotoIds.includes(failure.photoId)) {
+          tabResult.fullSizeFailedPhotoIds.push(failure.photoId);
+        }
+        tabResult.metadataError = [tabResult.metadataError, failure.error]
+          .filter(Boolean).join('; ');
+      }
+    }
+  } else {
+    for (const tabResult of Object.values(photoScrape.tabs)) {
+      tabResult.fullSizeMetadataStatus = tabResult.status === 'success' ? 'success' : tabResult.status;
+      tabResult.fullSizeFailedPhotoIds = [];
+    }
+  }
+
+  await page.goto('about:blank').catch(() => {});
+  photoScrape.timing.totalDurationMs = Date.now() - totalStartedAt;
+
   return { photos, photoScrape };
 }
 
-async function collectGooglePhotoTab(page, canonicalUrl, tab) {
+function photoLimitForTab(tab) {
+  const normalized = normalizePhotoTabName(tab);
+  return photoTabLimits.get(normalized) ?? photoMaxPerPlace;
+}
+
+async function collectGooglePhotoTab(page, canonicalUrl, tab, scanLimit) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      const photos = await collectGooglePhotoTabOnce(page, canonicalUrl, tab);
+      const photos = await collectGooglePhotoTabOnce(page, canonicalUrl, tab, scanLimit);
       if (photos.length) return { status: 'success', attempts: attempt, photos, error: null };
       if (attempt === 2) return { status: 'none', attempts: attempt, photos: [], error: null };
     } catch (error) {
@@ -954,71 +1826,38 @@ async function collectGooglePhotoTab(page, canonicalUrl, tab) {
   };
 }
 
-async function collectGooglePhotoTabOnce(page, canonicalUrl, tab) {
+async function collectGooglePhotoTabOnce(page, canonicalUrl, tab, scanLimit) {
   await page.goto(canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
   await acceptConsentIfShown(page);
+  await enforceGoogleSafety(page, { url: canonicalUrl, userData: {} });
   await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
   const heading = await page.locator('h1').first().innerText().catch(() => '');
   if (/can't reach the internet|something went wrong|no internet/i.test(heading)) {
     throw new Error(`Google Maps error page: ${heading}`);
   }
   if (!await openGooglePhotoGallery(page)) return [];
+  if (!await clickGooglePhotoTab(page, tab)) return [];
+  await page.locator('a.MIgS0d[data-photo-index]').first()
+    .waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
 
-  const networkUrls = new Map();
-  const pendingBodies = [];
-  let acceptedResponses = 0;
-  const responseListener = (response) => {
-    const resourceType = response.request().resourceType();
-    if (!['xhr', 'fetch'].includes(resourceType)
-      || !/google\.[^/]+\/maps/i.test(response.url())
-      || acceptedResponses >= 30) return;
-    acceptedResponses += 1;
-    const pending = response.body().then((body) => {
-      if (body.length > 750_000) return;
-      for (const source of extractGooglePhotoUrls(body.toString('utf8'))) {
-        networkUrls.set(photoIdentity(source), source);
+  const photosById = new Map();
+  let stalledRounds = 0;
+  for (let round = 0; round < photoScrollRounds; round += 1) {
+    const before = photosById.size;
+    const loaded = await describeGoogleGalleryPhotos(page, scanLimit);
+    for (const photo of loaded) {
+      if (!photo.looksLikeVideo && !photosById.has(photo.photoId)) {
+        photosById.set(photo.photoId, photo);
       }
-    }).catch(() => {});
-    pendingBodies.push(pending);
-  };
-  page.on('response', responseListener);
-
-  try {
-    if (!await clickGooglePhotoTab(page, tab)) return [];
-    await page.locator('a.MIgS0d[data-photo-index]').first()
-      .waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
-
-    const photosById = new Map();
-    let stalledRounds = 0;
-    for (let round = 0; round < photoScrollRounds; round += 1) {
-      const before = photosById.size;
-      const loaded = await describeGoogleGalleryPhotos(page, photoScanLimit);
-      for (const photo of loaded) {
-        if (!photo.looksLikeVideo && !photosById.has(photo.photoId)) {
-          photosById.set(photo.photoId, photo);
-        }
-      }
-      stalledRounds = photosById.size === before ? stalledRounds + 1 : 0;
-      if (photosById.size >= photoScanLimit) break;
-      const scroll = await scrollGooglePhotoGallery(page);
-      if (scroll.atBottom && stalledRounds >= 3) break;
-      await page.waitForTimeout(650);
     }
-
-    await Promise.allSettled(pendingBodies);
-    for (const [photoId, sourceImageUrl] of networkUrls) {
-      if (!photoId || photosById.has(photoId) || photosById.size >= photoScanLimit) continue;
-      photosById.set(photoId, {
-        photoId,
-        sourceImageUrl,
-        photoIndex: null,
-        discoverySource: 'network',
-      });
-    }
-    return [...photosById.values()];
-  } finally {
-    page.off('response', responseListener);
+    stalledRounds = photosById.size === before ? stalledRounds + 1 : 0;
+    if (photosById.size >= scanLimit) break;
+    const scroll = await scrollGooglePhotoGallery(page);
+    if (!scroll.found && stalledRounds >= 3) break;
+    if (scroll.atBottom && stalledRounds >= 3) break;
+    await page.waitForTimeout(650);
   }
+  return [...photosById.values()];
 }
 
 async function openGooglePhotoGallery(page) {
@@ -1037,7 +1876,11 @@ async function openGooglePhotoGallery(page) {
 }
 
 async function clickGooglePhotoTab(page, tab) {
-  const pattern = new RegExp(`^\\s*${escapeRegExp(tab)}\\s*$`, 'i');
+  const normalized = normalizePhotoTabName(tab);
+  const labelPattern = normalized === 'food & drink'
+    ? 'food\\s*(?:&|and)\\s*drink'
+    : escapeRegExp(tab);
+  const pattern = new RegExp(`^\\s*${labelPattern}\\s*$`, 'i');
   const candidates = [
     page.getByRole('tab', { name: pattern }),
     page.getByRole('button', { name: pattern }),
@@ -1092,101 +1935,202 @@ async function scrollGooglePhotoGallery(page) {
     let scroller = anchor?.parentElement;
     while (scroller && scroller !== document.body) {
       const box = scroller.getBoundingClientRect();
-      if (scroller.scrollHeight > scroller.clientHeight + 20 && box.width > 0 && box.width < 700) break;
+      if (scroller.scrollHeight > scroller.clientHeight + 20 && box.width > 0 && box.height > 0) break;
       scroller = scroller.parentElement;
     }
-    if (!scroller || scroller === document.body) return { atBottom: false };
+    if (!scroller || scroller === document.body) return { found: false, atBottom: true };
     scroller.scrollBy(0, Math.max(Math.floor(scroller.clientHeight * 0.85), 650));
-    return { atBottom: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5 };
+    return {
+      found: true,
+      atBottom: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5,
+    };
   });
 }
 
-async function collectGooglePhotoDates(page, canonicalUrl, orderedPhotoIds) {
-  await page.goto(canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await acceptConsentIfShown(page);
-  if (!await openGooglePhotoGallery(page)) return new Map();
-  await clickGooglePhotoTab(page, photoTabs.includes('All') ? 'All' : photoTabs[0]);
-  const first = page.locator('a.MIgS0d[data-photo-index]:visible').first();
-  if (!await first.isVisible().catch(() => false)) return new Map();
-  await first.click();
-
+async function collectGooglePhotoDates(
+  page,
+  canonicalUrl,
+  tab,
+  orderedPhotos,
+  onPageReleased = null,
+) {
+  if (!orderedPhotos.length) return new Map();
   const dates = new Map();
-  let previousFingerprint = null;
-  let repeated = 0;
-  for (let index = 0; index < orderedPhotoIds.length; index += 1) {
-    await page.waitForTimeout(500);
-    const snapshot = await page.evaluate(() => {
-      const decodedUrl = decodeURIComponent(location.href);
-      const urlPhotoId = decodedUrl.match(/googleusercontent\.com\/(?:p|gps-cs-s)\/([^=!/?]+)/)?.[1] || null;
-      const visibleImages = [...document.querySelectorAll('[style*="googleusercontent"]')]
-        .map((element) => {
-          const box = element.getBoundingClientRect();
-          const source = element.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/)?.[1] || '';
-          return { source, area: Math.max(0, box.width) * Math.max(0, box.height) };
-        })
-        .filter(({ source, area }) => area > 40_000 && /googleusercontent\.com/.test(source))
-        .sort((left, right) => right.area - left.area);
-      const backgroundPhotoId = visibleImages[0]?.source
-        .match(/googleusercontent\.com\/(?:p|gps-cs-s)\/([^=]+)/)?.[1] || null;
-      const photoId = urlPhotoId || backgroundPhotoId;
-      const lines = document.body.innerText.split(/\n+/).map((line) => line.replace(/\s+/g, ' ').trim());
-      const labels = [...document.querySelectorAll('[aria-label]')]
-        .map((element) => (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim());
-      const dateText = lines.find((line) => /^Photo\s*[-–—]\s*.+/i.test(line))
-        || lines.find((line) => /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?(?:19|20)\d{2}$/i.test(line))
-        || labels.find((line) => /^Photo\s*[-–—]\s*.+/i.test(line))
-        || null;
-      return {
-        photoId,
-        dateText,
-        fingerprint: photoId || visibleImages[0]?.source || location.href,
-      };
+  const browserContext = page.context();
+  await page.goto('about:blank').catch(() => {});
+  onPageReleased?.();
+  const batches = [];
+  for (let batchStart = 0; batchStart < orderedPhotos.length; batchStart += photoDateBatchSize) {
+    batches.push({
+      batchStart,
+      photos: orderedPhotos.slice(batchStart, batchStart + photoDateBatchSize),
     });
-    const resolvedPhotoId = snapshot.photoId || orderedPhotoIds[index];
-    if (!resolvedPhotoId) break;
-    if (snapshot.fingerprint === previousFingerprint) repeated += 1;
-    else repeated = 0;
-    if (repeated >= 2) break;
-    previousFingerprint = snapshot.fingerprint;
-    if (snapshot.dateText) dates.set(resolvedPhotoId, parseGoogleUploadDate(snapshot.dateText));
-
-    const next = page.getByRole('button', { name: /next/i }).filter({ visible: true }).first();
-    if (await next.isVisible().catch(() => false)) await next.click().catch(() => {});
-    else await page.keyboard.press('ArrowRight').catch(() => {});
-    await page.waitForTimeout(700);
   }
-  await page.keyboard.press('Escape').catch(() => {});
+  let batchCursor = 0;
+  const worker = async () => {
+    while (batchCursor < batches.length) {
+      const batchIndex = batchCursor;
+      batchCursor += 1;
+      const { batchStart, photos: batch } = batches[batchIndex];
+      const datePage = await browserContext.newPage();
+      try {
+        await datePage.setExtraHTTPHeaders({ 'Accept-Language': 'en-MY,en;q=0.9' });
+        await openGooglePhotoDateViewer(datePage, canonicalUrl, tab, batch[0]);
+
+        let previousFingerprint = null;
+        let repeated = 0;
+        for (let index = 0; index < batch.length; index += 1) {
+          await datePage.waitForTimeout(photoDateWaitMs);
+          const includeDiagnostics = photoDebug && batchStart === 0 && index === 0;
+          const snapshot = await readGooglePhotoDateSnapshot(datePage, includeDiagnostics);
+          if (photoDebug && batchStart === 0 && index === 0) {
+            log.info(`Photo-date diagnostic for ${tab}`, {
+              photoId: snapshot.photoId,
+              dateText: snapshot.dateText,
+              lines: snapshot.diagnosticLines,
+              labels: snapshot.diagnosticLabels,
+            });
+          }
+          const resolvedPhotoId = batch[index].photoId || snapshot.photoId;
+          if (!resolvedPhotoId) break;
+          if (snapshot.fingerprint === previousFingerprint) repeated += 1;
+          else repeated = 0;
+          if (repeated >= 2) break;
+          previousFingerprint = snapshot.fingerprint;
+          if (snapshot.dateText) {
+            dates.set(resolvedPhotoId, parseGoogleUploadDate(snapshot.dateText));
+          }
+
+          const currentIndex = batch[index].photoIndex;
+          const nextIndex = batch[index + 1]?.photoIndex;
+          const steps = Number.isFinite(currentIndex) && Number.isFinite(nextIndex) && nextIndex > currentIndex
+            ? nextIndex - currentIndex
+            : 1;
+          for (let step = 0; step < steps && index + 1 < batch.length; step += 1) {
+            const next = datePage.locator('button[aria-label*="next" i]:visible').first();
+            if (await next.isVisible().catch(() => false)) await next.click().catch(() => {});
+            else await datePage.keyboard.press('ArrowRight').catch(() => {});
+            // The next item waits before reading. Only pause here when another
+            // intermediate click is needed to skip an omitted/video index.
+            if (step + 1 < steps) await datePage.waitForTimeout(photoDateWaitMs);
+          }
+        }
+      } finally {
+        await datePage.close().catch(() => {});
+      }
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(photoDateConcurrency, batches.length) },
+    worker,
+  ));
   return dates;
 }
 
-function parseGoogleUploadDate(value) {
-  const text = value.replace(/^Photo\s*[-–—]\s*/i, '').trim();
-  const months = {
-    jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
-    may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
-    sep: 9, sept: 9, september: 9, oct: 10, october: 10,
-    nov: 11, november: 11, dec: 12, december: 12,
-  };
-  const match = text.match(/^([A-Za-z]+)\.?\s+(?:(\d{1,2}),?\s+)?((?:19|20)\d{2})$/);
-  if (!match) return { text, year: null, month: null, day: null };
-  return {
-    text,
-    year: Number(match[3]),
-    month: months[match[1].toLowerCase()] ?? null,
-    day: match[2] ? Number(match[2]) : null,
-  };
+async function openGooglePhotoDateViewer(page, canonicalUrl, tab, photo) {
+  await page.goto(canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  await acceptConsentIfShown(page);
+  await enforceGoogleSafety(page, { url: canonicalUrl, userData: {} });
+  await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
+  if (!await openGooglePhotoGallery(page)) {
+    throw new Error('The Google Maps photo gallery did not open for upload-date capture.');
+  }
+  const tabReady = await clickGooglePhotoTab(page, tab);
+  if (!tabReady) throw new Error(`The ${tab} photo tab did not open for upload-date capture.`);
+  await page.locator('a.MIgS0d[data-photo-index]').first()
+    .waitFor({ state: 'visible', timeout: 10_000 });
+
+  await resetGooglePhotoGallery(page);
+  if (!await clickGoogleGalleryPhoto(page, photo)) {
+    throw new Error(`Could not reopen photo index ${photo.photoIndex ?? 'unknown'} in the ${tab} tab.`);
+  }
 }
 
-function photoDateRank(uploadDate) {
-  if (!uploadDate?.year) return Number.NEGATIVE_INFINITY;
-  return Date.UTC(uploadDate.year, (uploadDate.month ?? 1) - 1, uploadDate.day ?? 1);
+async function clickGoogleGalleryPhoto(page, photo) {
+  let stalledRounds = 0;
+  for (let round = 0; round < photoScrollRounds; round += 1) {
+    const clicked = await page.evaluate(({ photoId, photoIndex }) => {
+      const cards = [...document.querySelectorAll('a.MIgS0d[data-photo-index]')];
+      const card = cards.find((candidate) => [...candidate.querySelectorAll('[style]')]
+        .some((element) => element.style.backgroundImage.includes(photoId)))
+        || cards.find((candidate) => Number(candidate.dataset.photoIndex) === photoIndex);
+      if (!card) return false;
+      card.click();
+      return true;
+    }, photo).catch(() => false);
+    if (clicked) return true;
+    const scroll = await scrollGooglePhotoGallery(page);
+    stalledRounds = scroll.found ? 0 : stalledRounds + 1;
+    if (scroll.atBottom || stalledRounds >= 3) break;
+    await page.waitForTimeout(300);
+  }
+  return false;
 }
+
+async function readGooglePhotoDateSnapshot(page, includeDiagnostics) {
+  return page.evaluate((debug) => {
+    const decodedUrl = decodeURIComponent(location.href);
+    const urlPhotoId = decodedUrl.match(/googleusercontent\.com\/(?:p|gps-cs-s)\/([^=!/?]+)/)?.[1] || null;
+    const visibleImages = [...document.querySelectorAll('[style*="googleusercontent"]')]
+      .map((element) => {
+        const box = element.getBoundingClientRect();
+        const source = element.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/)?.[1] || '';
+        return { source, area: Math.max(0, box.width) * Math.max(0, box.height) };
+      })
+      .filter(({ source, area }) => area > 40_000 && /googleusercontent\.com/.test(source))
+      .sort((left, right) => right.area - left.area);
+    const backgroundPhotoId = visibleImages[0]?.source
+      .match(/googleusercontent\.com\/(?:p|gps-cs-s)\/([^=]+)/)?.[1] || null;
+    const photoId = urlPhotoId || backgroundPhotoId;
+    const lines = document.body.innerText.split(/\n+/)
+      .map((line) => line.replace(/\s+/g, ' ').trim());
+    const labels = [...document.querySelectorAll('[aria-label]')]
+      .map((element) => (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim());
+    const dateText = lines.find((line) => /^Photo\s*[-–—]\s*.+/i.test(line))
+      || labels.find((line) => /^Photo\s*[-–—]\s*.+/i.test(line))
+      || lines.find((line) => /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?(?:19|20)\d{2}$/i.test(line))
+      || lines.find((line) => /^(?:(?:a|an|\d+)\s+(?:day|week|month|year)s?\s+ago|today|yesterday)$/i.test(line))
+      || null;
+    return {
+      photoId,
+      dateText,
+      fingerprint: photoId || visibleImages[0]?.source || location.href,
+      diagnosticLines: debug
+        ? lines.filter((line) => /\b(?:ago|photo|uploaded|20\d{2})\b/i.test(line)).slice(0, 40)
+        : [],
+      diagnosticLabels: debug
+        ? labels.filter((line) => /\b(?:ago|photo|uploaded|20\d{2})\b/i.test(line)).slice(0, 40)
+        : [],
+    };
+  }, includeDiagnostics);
+}
+
+async function resetGooglePhotoGallery(page) {
+  await page.evaluate(() => {
+    const card = [...document.querySelectorAll('a.MIgS0d[data-photo-index]')]
+      .find((candidate) => {
+        const box = candidate.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      });
+    let scroller = card?.parentElement;
+    while (scroller && scroller !== document.body) {
+      const box = scroller.getBoundingClientRect();
+      if (scroller.scrollHeight > scroller.clientHeight + 20 && box.width > 0 && box.height > 0) {
+        scroller.scrollTo(0, 0);
+        return;
+      }
+      scroller = scroller.parentElement;
+    }
+  }).catch(() => {});
+  await page.waitForTimeout(500);
+}
+
 
 async function probeFullSizePhotos(page, photos) {
   const inputs = photos.map(({ sourceImageUrl }) => ({
     url: `${sourceImageUrl.replace(/=[^/]*$/, '')}=s0`,
   }));
-  return page.evaluate(async (entries) => {
+  return page.evaluate(async ({ entries, concurrency }) => {
     const results = new Array(entries.length);
     let cursor = 0;
     const worker = async () => {
@@ -1211,30 +2155,10 @@ async function probeFullSizePhotos(page, photos) {
         });
       }
     };
-    // Full-size Google images can be large. Probe them one at a time to keep
-    // Chrome's peak memory stable while preserving URL and dimension data.
-    await Promise.all(Array.from({ length: Math.min(1, entries.length) }, worker));
+    // Keep concurrency bounded because full-size Google images can be large.
+    await Promise.all(Array.from({ length: Math.min(concurrency, entries.length) }, worker));
     return results;
-  }, inputs);
-}
-
-function photoIdentity(source) {
-  return source.match(/googleusercontent\.com\/(?:p|gps-cs-s)\/([^=]+)/)?.[1]
-    || source.replace(/=[^/]*$/, '');
-}
-
-function extractGooglePhotoUrls(body) {
-  const normalized = body
-    .replaceAll('\\u003d', '=')
-    .replaceAll('\\u0026', '&')
-    .replaceAll('\\/', '/');
-  const matches = normalized.match(/(?:https?:)?\/\/lh\d+\.googleusercontent\.com\/(?:p|gps-cs-s)\/[A-Za-z0-9_-]+(?:=[A-Za-z0-9_-]+)?/g) || [];
-  const photos = new Map();
-  for (const match of matches) {
-    const source = match.startsWith('//') ? `https:${match}` : match;
-    photos.set(photoIdentity(source), source);
-  }
-  return [...photos.values()];
+  }, { entries: inputs, concurrency: photoProbeConcurrency });
 }
 
 function positiveInteger(value, fallback) {
@@ -1373,9 +2297,11 @@ function derivePeakHoursFromBreakdown(popularTimes) {
 
 function toCsv(items) {
   const columns = [
-    'name', 'rating', 'area', 'category', 'brandSize', 'numberOfOutlets',
-    'address', 'contact', 'reviewCount', 'priceLevel', 'openingHours', 'menu',
+    'name', 'placeId', 'featureId', 'latitude', 'longitude', 'rating', 'area',
+    'category', 'businessStatus', 'brandSize', 'numberOfOutlets',
+    'address', 'contact', 'reviewCount', 'priceLevel', 'openingHours', 'menu', 'menuScrape',
     'popularTimes', 'peakHours', 'query', 'about', 'photos', 'photoScrape',
+    'reviews', 'reviewScrape',
     'googleMapsUrl', 'scrapedAt',
   ];
   const escape = (value) => {

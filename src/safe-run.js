@@ -15,8 +15,10 @@ const areas = (process.env.AREAS?.trim() || process.env.AREA?.trim() || 'Kuala L
   .split('|')
   .map((value) => value.trim())
   .filter(Boolean);
-const directPlaceCount = (process.env.PLACE_URLS?.trim() || '')
-  .split('|')
+const directPlaceCount = [
+  ...(process.env.PLACE_IDS?.trim() || '').split('|'),
+  ...(process.env.PLACE_URLS?.trim() || '').split('|'),
+]
   .map((value) => value.trim())
   .filter(Boolean)
   .slice(0, maxPlaces)
@@ -29,6 +31,8 @@ const storageDir = resolve(process.env.CRAWLEE_STORAGE_DIR?.trim() || 'storage')
 let freshRun = !resume;
 let consecutiveFailures = 0;
 let lastExitCode = 0;
+let overallExitCode = 0;
+let safetyStopped = false;
 
 console.log(
   `[safe-run] ${freshRun ? 'Starting a fresh scrape' : 'Resuming the existing scrape'} `
@@ -74,8 +78,21 @@ while (true) {
   const after = await readCrawlState(storageDir);
   const madeProgress = after.queue.handled > before.queue.handled || after.processed > before.processed;
 
-  if (lastExitCode === 0) {
+  if (lastExitCode === 2) {
+    overallExitCode = 2;
+    safetyStopped = true;
+    console.error(
+      '[safe-run] Safety stop received. Chrome will not restart automatically. '
+      + 'Resolve the Google login/block condition, then use `npm run resume:safe`.',
+    );
+  } else if (lastExitCode === 0) {
     consecutiveFailures = 0;
+  } else if (lastExitCode === 1 && madeProgress) {
+    overallExitCode = Math.max(overallExitCode, 1);
+    consecutiveFailures = 0;
+    console.warn(
+      '[safe-run] The batch completed with one or more terminal place failures; continuing the queue.',
+    );
   } else {
     consecutiveFailures += 1;
     console.warn(
@@ -83,6 +100,8 @@ while (true) {
       + `Progress is preserved; restart attempt ${consecutiveFailures}/${maxConsecutiveFailures}.`,
     );
   }
+
+  if (safetyStopped) break;
 
   if (after.queue.total === 0) {
     if (lastExitCode === 0) {
@@ -110,16 +129,6 @@ while (true) {
   );
 
   if (after.queue.total > 0 && after.queue.pending === 0) {
-    if (lastExitCode !== 0) {
-      console.log('[safe-run] Running a final export checkpoint after the interrupted process.');
-      const checkpointCode = await runMain({
-        purgeOnStart: false,
-        maxRequestsPerCrawl: Math.max(after.processed, after.queue.handled),
-      });
-      if (checkpointCode !== 0) {
-        throw new Error(`Final export checkpoint exited with code ${checkpointCode}.`);
-      }
-    }
     break;
   }
 
@@ -142,10 +151,18 @@ while (true) {
 }
 
 const finalState = await readCrawlState(storageDir);
-console.log(
-  `[safe-run] Complete. ${finalState.queue.handled}/${finalState.queue.total} requests handled. `
-  + 'Final outputs are in the configured output directory.',
-);
+if (safetyStopped) {
+  console.error(
+    `[safe-run] Stopped safely. ${finalState.queue.handled}/${finalState.queue.total} requests handled; `
+    + `${finalState.queue.pending} remain queued for resume.`,
+  );
+} else {
+  console.log(
+    `[safe-run] Complete. ${finalState.queue.handled}/${finalState.queue.total} requests handled. `
+    + 'Final outputs are in the configured output directory.',
+  );
+}
+process.exitCode = safetyStopped ? 2 : overallExitCode;
 
 function runMain({ purgeOnStart, maxRequestsPerCrawl }) {
   return new Promise((resolveExit) => {
