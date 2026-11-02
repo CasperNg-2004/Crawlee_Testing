@@ -23,6 +23,7 @@ import {
   parseGoogleUploadDate,
   photoDateRank,
 } from './photo-utils.js';
+import { flattenPhotoList, photoListToCsv } from './photo-export.js';
 import { extractGoogleReviews, normalizeReviewSort } from './review-scraper.js';
 import { classifyGoogleSafetyState, isSuspiciousEmptyMenu } from './safety.js';
 
@@ -593,13 +594,18 @@ const remainingSafetyFailures = appendRemainingSafetyFailures();
 
 const dataset = await Dataset.getData({ limit: maxPlaces });
 await mkdir(outputDir, { recursive: true });
+let exportedRecords = dataset.items;
 if (onePlaceMode) {
   const onePlaceRecord = dataset.items[0] ?? failedRestaurantRecords[0] ?? null;
+  exportedRecords = onePlaceRecord ? [onePlaceRecord] : [];
   await writeFileAtomic(`${outputDir}/place.json`, `${JSON.stringify(onePlaceRecord, null, 2)}\n`);
 } else {
   await writeFileAtomic(`${outputDir}/restaurants.json`, `${JSON.stringify(dataset.items, null, 2)}\n`);
   await writeFileAtomic(`${outputDir}/restaurants.csv`, toCsv(dataset.items));
 }
+const photoList = flattenPhotoList(exportedRecords);
+await writeFileAtomic(`${outputDir}/photo-list.json`, `${JSON.stringify(photoList, null, 2)}\n`);
+await writeFileAtomic(`${outputDir}/photo-list.csv`, photoListToCsv(photoList));
 await writeFileAtomic(
   `${outputDir}/failed-restaurants.json`,
   `${JSON.stringify(failedRestaurantRecords, null, 2)}\n`,
@@ -609,7 +615,8 @@ log.info(
   + `Scraped ${successfulPlaceCount}/${queuedPlaceCount} places successfully; ${failedPlaceCount} failed. `
   + (onePlaceMode
     ? `Exported the one-place result to ${outputDir}/place.json.`
-    : `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`),
+    : `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`)
+  + ` Exported ${photoList.length} photo-tab rows to ${outputDir}/photo-list.json and ${outputDir}/photo-list.csv.`,
 );
 const exitCode = fatalSafetyStop ? 2 : failedPlaceCount > 0 ? 1 : 0;
 const runStatus = fatalSafetyStop ? 'safety_stopped' : failedPlaceCount > 0 ? 'completed_with_failures' : 'success';
@@ -2059,10 +2066,40 @@ async function clickGoogleGalleryPhoto(page, photo) {
       return true;
     }, photo).catch(() => false);
     if (clicked) return true;
+
+    const before = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('a.MIgS0d[data-photo-index]')];
+      return {
+        count: cards.length,
+        maxIndex: cards.reduce((maximum, card) => {
+          const index = Number(card.dataset.photoIndex);
+          return Number.isFinite(index) ? Math.max(maximum, index) : maximum;
+        }, -1),
+      };
+    }).catch(() => ({ count: 0, maxIndex: -1 }));
     const scroll = await scrollGooglePhotoGallery(page);
-    stalledRounds = scroll.found ? 0 : stalledRounds + 1;
-    if (scroll.atBottom || stalledRounds >= 3) break;
-    await page.waitForTimeout(300);
+    const targetAppearedOrGalleryGrew = await page.waitForFunction(
+      ({ photoId, photoIndex, previousCount, previousMaxIndex }) => {
+        const cards = [...document.querySelectorAll('a.MIgS0d[data-photo-index]')];
+        const targetVisible = cards.some((candidate) => [...candidate.querySelectorAll('[style]')]
+          .some((element) => element.style.backgroundImage.includes(photoId)))
+          || cards.some((candidate) => Number(candidate.dataset.photoIndex) === photoIndex);
+        if (targetVisible || cards.length > previousCount) return true;
+        return cards.some((card) => Number(card.dataset.photoIndex) > previousMaxIndex);
+      },
+      {
+        photoId: photo.photoId,
+        photoIndex: photo.photoIndex,
+        previousCount: before.count,
+        previousMaxIndex: before.maxIndex,
+      },
+      { timeout: Math.max(1_200, Math.min(photoDateWaitMs * 6, 3_000)) },
+    ).then(() => true).catch(() => false);
+
+    stalledRounds = targetAppearedOrGalleryGrew ? 0 : stalledRounds + 1;
+    // Google briefly reports the current lazy-loaded edge as the bottom. Only
+    // stop after the edge remains unchanged across several growth waits.
+    if ((!scroll.found || scroll.atBottom) && stalledRounds >= 3) break;
   }
   return false;
 }

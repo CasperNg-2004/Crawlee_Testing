@@ -467,6 +467,14 @@ unique photos across all five tabs. A successful tab can contain fewer than its
 configured limit when Google exposes fewer photos. When upload-date collection
 is explicitly disabled, `uploadDate` is intentionally `null`.
 
+Every run also writes `photo-list.json` and `photo-list.csv` beside the main
+output. These are flat reader inputs with one row per photo and source tab:
+`placeId`, `shopName`, `photoId`, `tab`, `uploadDate`, and `fullSizeImageUrl`.
+A photo present in multiple tabs has one row for each tab. See
+`PHOTO_TOOLS_HANDOVER.md` for the short analysis and labelling handover.
+For an existing result, regenerate them with
+`npm run export:photos -- output\restaurants.json`.
+
 To scrape only one photo tab for a supplied list of places, override
 `PHOTO_TABS` for that PowerShell session:
 

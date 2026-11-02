@@ -17,6 +17,7 @@
     "analyze:photos:resume": "node --env-file=.env src/analyze-photos.js --resume",
     "analyze:photos:evaluate": "node --env-file=.env src/analyze-photos.js --evaluate-only",
     "label:photos": "node --env-file=.env src/label-photos.js",
+    "export:photos": "node --env-file=.env src/export-photo-list.js",
     "test": "node --test"
   },
   "dependencies": {
