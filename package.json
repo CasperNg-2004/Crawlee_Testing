@@ -18,12 +18,14 @@
     "analyze:photos:evaluate": "node --env-file=.env src/analyze-photos.js --evaluate-only",
     "label:photos": "node --env-file=.env src/label-photos.js",
     "export:photos": "node --env-file=.env src/export-photo-list.js",
+    "export:excel": "node --env-file=.env src/export-excel.js",
     "test": "node --test"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
     "crawlee": "^3.15.0",
     "cross-env": "^10.0.0",
+    "exceljs": "^4.4.0",
     "playwright": "^1.55.0",
     "sharp": "^0.35.5",
     "tesseract.js": "^7.0.0"

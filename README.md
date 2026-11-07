@@ -155,6 +155,7 @@ Tesseract language data. Later runs reuse `.cache/transformers` and
 | `npm run analyze:photos:resume` | Resume the newest incomplete photo-analysis checkpoint. |
 | `npm run label:photos` | Open the local browser photo-labelling interface. |
 | `npm run analyze:photos:evaluate` | Recalculate photo and optional OCR metrics from saved labels. |
+| `npm run export:excel -- output\restaurants.json` | Rebuild the client-readable Excel workbook from an existing JSON output. |
 
 ## Google Maps login
 
@@ -448,6 +449,7 @@ Each normal run writes:
 
 - `output/restaurants.json`
 - `output/restaurants.csv`
+- `output/restaurants.xlsx`
 - `output/failed-restaurants.json`
 
 Crawlee also keeps its local dataset under `storage/datasets/default/`. Nested fields such as `menu`, `openingHours`, `popularTimes`, `peakHours`, `about`, and `contact` are stored as JSON strings inside the CSV.
@@ -474,6 +476,15 @@ A photo present in multiple tabs has one row for each tab. See
 `PHOTO_TOOLS_HANDOVER.md` for the short analysis and labelling handover.
 For an existing result, regenerate them with
 `npm run export:photos -- output\restaurants.json`.
+
+Every completed run also writes `restaurants.xlsx` while retaining
+`restaurants.json` and `restaurants.csv`. The workbook separates client-readable
+data into `Places`, `Menu`, `Photos`, `Reviews`, `Opening Hours`,
+`Popular Times`, and `About` worksheets. To rebuild it from an existing result:
+
+```powershell
+npm run export:excel -- output\restaurants.json
+```
 
 To scrape only one photo tab for a supplied list of places, override
 `PHOTO_TABS` for that PowerShell session:
@@ -800,7 +811,9 @@ details, profile URLs/photos, histories, and owner responses are not collected.
 saved Google Maps URL with the dedicated Chrome profile, selects the configured
 sort, expands truncated text, and collects up to the configured limit. It stays
 separate from the main scraper so review failures cannot invalidate complete
-place, menu, Popular-times, About, and photo records.
+place, menu, Popular-times, About, and photo records. It reuses the same shared
+review collector as the main scraper so selector and validation fixes are not
+duplicated across two implementations.
 
 Run the default input and limits:
 
@@ -1364,6 +1377,7 @@ config/
 output/
   restaurants.json
   restaurants.csv
+  restaurants.xlsx
   failed-restaurants.json
   recon-reviews/<timestamp>/
   photo-analysis/<timestamp>/

@@ -24,6 +24,7 @@ import {
   photoDateRank,
 } from './photo-utils.js';
 import { flattenPhotoList, photoListToCsv } from './photo-export.js';
+import { exportRestaurantsToExcel } from './excel-export.js';
 import { extractGoogleReviews, normalizeReviewSort } from './review-scraper.js';
 import { classifyGoogleSafetyState, isSuspiciousEmptyMenu } from './safety.js';
 
@@ -606,6 +607,10 @@ if (onePlaceMode) {
 const photoList = flattenPhotoList(exportedRecords);
 await writeFileAtomic(`${outputDir}/photo-list.json`, `${JSON.stringify(photoList, null, 2)}\n`);
 await writeFileAtomic(`${outputDir}/photo-list.csv`, photoListToCsv(photoList));
+const excelOutputPath = onePlaceMode
+  ? `${outputDir}/place.xlsx`
+  : `${outputDir}/restaurants.xlsx`;
+await exportRestaurantsToExcel(exportedRecords, excelOutputPath);
 await writeFileAtomic(
   `${outputDir}/failed-restaurants.json`,
   `${JSON.stringify(failedRestaurantRecords, null, 2)}\n`,
@@ -616,7 +621,8 @@ log.info(
   + (onePlaceMode
     ? `Exported the one-place result to ${outputDir}/place.json.`
     : `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`)
-  + ` Exported ${photoList.length} photo-tab rows to ${outputDir}/photo-list.json and ${outputDir}/photo-list.csv.`,
+  + ` Exported ${photoList.length} photo-tab rows to ${outputDir}/photo-list.json and ${outputDir}/photo-list.csv.`
+  + ` Exported the Excel workbook to ${excelOutputPath}.`,
 );
 const exitCode = fatalSafetyStop ? 2 : failedPlaceCount > 0 ? 1 : 0;
 const runStatus = fatalSafetyStop ? 'safety_stopped' : failedPlaceCount > 0 ? 'completed_with_failures' : 'success';
@@ -1263,30 +1269,56 @@ async function getMenuCategoryNames(page) {
 }
 
 async function clickMenuCategory(page, categoryName) {
-  const candidates = page.locator('[role="tab"]').filter({
-    // Playwright serializes regular-expression text filters into its internal
-    // selector syntax. Category names containing repeated apostrophes (for
-    // example, an inch measurement such as 9.5'') can be misread as selector
-    // flags. Use a plain-text candidate filter and retain the exact aria-label
-    // comparison below.
-    hasText: categoryName,
-  });
+  const normalizedName = categoryName
+    .replace(/[\uE000-\uF8FF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const tabs = page.locator('[role="tab"]');
+  const findCandidateIndex = () => tabs.evaluateAll((elements, target) => {
+    const clean = (value) => value
+      ?.replace(/[\uE000-\uF8FF]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase() || '';
+    return elements.findIndex((tab) => {
+      const text = clean(tab.textContent);
+      const ariaLabel = clean(tab.getAttribute('aria-label'));
+      return text === target || ariaLabel === target;
+    });
+  }, normalizedName);
+  const waitForSelection = () => page.waitForFunction(
+    (target) => {
+      const clean = (value) => value
+        ?.replace(/[\uE000-\uF8FF]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase() || '';
+      return [...document.querySelectorAll('[role="tab"]')].some((tab) =>
+        (clean(tab.textContent) === target
+          || clean(tab.getAttribute('aria-label')) === target)
+        && tab.getAttribute('aria-selected') === 'true');
+    },
+    normalizedName,
+    { timeout: 3_000 },
+  ).then(() => true).catch(() => false);
 
-  for (let index = 0; index < await candidates.count(); index += 1) {
-    const candidate = candidates.nth(index);
-    const ariaLabel = (await candidate.getAttribute('aria-label') || '').trim();
-    if (ariaLabel.toLowerCase() !== categoryName.toLowerCase()
-      || !await candidate.isVisible().catch(() => false)) continue;
-    await candidate.click().catch(() => {});
-    await candidate.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {});
-    await page.waitForFunction(
-      (name) => [...document.querySelectorAll('[role="tab"]')].some((tab) =>
-        tab.getAttribute('aria-label')?.trim().toLowerCase() === name.toLowerCase()
-        && tab.getAttribute('aria-selected') === 'true'),
-      categoryName,
-      { timeout: 5_000 },
-    ).catch(() => {});
-    return true;
+  for (const activation of ['click', 'enter', 'dom-click']) {
+    const candidateIndex = await findCandidateIndex();
+    if (candidateIndex < 0) return false;
+    const candidate = tabs.nth(candidateIndex);
+    await candidate.scrollIntoViewIfNeeded().catch(() => {});
+
+    if (activation === 'click') {
+      await candidate.click({ timeout: 5_000 }).catch(() => {});
+    } else if (activation === 'enter') {
+      await candidate.focus().catch(() => {});
+      await page.keyboard.press('Enter').catch(() => {});
+    } else {
+      await candidate.evaluate((element) => element.click()).catch(() => {});
+    }
+
+    if (await waitForSelection()) return true;
   }
 
   return false;

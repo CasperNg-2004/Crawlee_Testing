@@ -63,9 +63,7 @@ export async function extractGoogleReviews(page, place, options = {}) {
         newestOrderViolations: collection.newestOrderViolations,
         unexpandedReviewCount: collection.unexpandedReviewCount,
       });
-      if (!bestAttempt || attemptResult.scrapedReviewCount > bestAttempt.scrapedReviewCount) {
-        bestAttempt = attemptResult;
-      }
+      bestAttempt = retainBestReviewAttempt(bestAttempt, attemptResult);
 
       if (collection.reviews.length) {
         const allowedOrderAmbiguities = Math.max(1, Math.floor(collection.reviews.length * 0.04));
@@ -124,6 +122,20 @@ export async function extractGoogleReviews(page, place, options = {}) {
       scrapedAt: new Date().toISOString(),
     },
   };
+}
+
+export function retainBestReviewAttempt(current, candidate) {
+  if (!candidate) return current;
+  if (!current) return candidate;
+
+  const currentCount = current.reviews?.length
+    ?? current.reviewScrape?.scrapedReviewCount
+    ?? 0;
+  const candidateCount = candidate.reviews?.length
+    ?? candidate.reviewScrape?.scrapedReviewCount
+    ?? 0;
+
+  return candidateCount > currentCount ? candidate : current;
 }
 
 function reviewResult({
@@ -266,6 +278,20 @@ async function collectReviews(page, { limit, maxScrollRounds, scrollWaitMs }) {
     if (reviewsByKey.size >= limit) break;
     stalledScrolls = reviewsByKey.size === before ? stalledScrolls + 1 : 0;
     const scrollState = await scrollReviewFeed(page);
+    if (stalledScrolls > 0 || scrollState.atBottom) {
+      const knownReviewIds = [...reviewsByKey.values()]
+        .map(({ reviewId }) => reviewId)
+        .filter(Boolean);
+      const loadedNewCard = await waitForNewReviewCard(
+        page,
+        knownReviewIds,
+        reviewGrowthWaitMs(scrollWaitMs),
+      );
+      if (loadedNewCard) {
+        stalledScrolls = 0;
+        continue;
+      }
+    }
     if ((stalledScrolls >= 5 && scrollState.atBottom) || stalledScrolls >= 8) break;
     await page.waitForTimeout(scrollWaitMs);
   }
@@ -276,6 +302,24 @@ async function collectReviews(page, { limit, maxScrollRounds, scrollWaitMs }) {
     unexpandedReviewCount: selected.filter(({ textExpandable }) => textExpandable).length,
     newestOrderViolations: countReviewOrderViolations(selected),
   };
+}
+
+async function waitForNewReviewCard(page, knownReviewIds, timeout) {
+  if (!knownReviewIds.length) return false;
+  return page.waitForFunction((knownIds) => {
+    const known = new Set(knownIds);
+    return [...document.querySelectorAll('div[data-review-id]')].some((card) => {
+      const reviewId = card.getAttribute('data-review-id');
+      const rect = card.getBoundingClientRect();
+      return reviewId && !known.has(reviewId)
+        && rect.width && rect.height && rect.bottom > 0 && rect.top < window.innerHeight
+        && card.querySelector('[role="img"][aria-label*="star" i]');
+    });
+  }, knownReviewIds, { timeout }).then(() => true).catch(() => false);
+}
+
+export function reviewGrowthWaitMs(scrollWaitMs) {
+  return Math.max(1_000, Math.min(2_500, positiveInteger(scrollWaitMs, 250) * 6));
 }
 
 async function expandVisibleReviewText(page, limit) {
