@@ -75,6 +75,21 @@ viewing and categorizing each image. The saved set contains 86 `menu`, 854
 image URLs. The optional `expectedOcrText` field was not filled, so these labels
 measure category accuracy but not OCR transcription accuracy.
 
+## Photo classification evaluation
+
+Two manually labelled datasets have been evaluated:
+
+| Dataset | Labels | Accuracy | Macro precision | Macro recall | Macro F1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original evaluation (18 October 2026) | 1,496 | 76.14% | 64.07% | 75.98% | 66.09% |
+| Latest evaluation (7 November 2026) | 596 | 81.21% | 70.13% | 77.12% | 70.92% |
+
+These metrics measure classification into `menu`, `food`, `interior`, and
+`unknown`. They do not measure OCR transcription accuracy because the
+`expectedOcrText` labels were not completed. The latest dataset scored higher,
+but the two results should not be treated as a strict model-to-model comparison
+because their photo and category distributions may differ.
+
 Recalculate classification metrics without downloading the photos again:
 
 ```powershell
