@@ -1,17 +1,20 @@
 # Google Maps café and drinks data pipeline
 
-This project uses Crawlee, Playwright, CLIP, and Tesseract to collect and review
-public Google Maps data for cafés and drink businesses in Malaysia. It can run
-multiple search terms across multiple Kuala Lumpur areas, distribute the final
-place limit fairly, visit each selected place, and export JSON and CSV files.
+This project uses Crawlee, Playwright, CLIP, and OCR to collect and review public
+Google Maps data for cafés and drink businesses in Malaysia. New photo-analysis
+runs use PaddleOCR for layout-aware menu text and price candidates; Tesseract is
+retained as a historical fallback. The scraper can run multiple search terms
+across multiple Kuala Lumpur areas, distribute the final place limit fairly,
+visit each selected place, and export JSON and CSV files.
 
 The current workflow has two primary stages plus an optional review diagnostic:
 
 1. The main scraper discovers locations and collects place details, structured
    menus, Popular times, About attributes, photos, 50 newest reviews, and
    Malaysia brand-size fields.
-2. The photo analyzer classifies saved photo URLs, runs OCR on predicted menu
-   photos, supports manual browser labelling, and calculates evaluation metrics.
+2. The photo analyzer classifies saved photo URLs, runs PaddleOCR on predicted
+   menu photos, supports manual browser labelling, and calculates evaluation
+   metrics. Tesseract remains available for historical-output reproduction.
 3. The optional independent review command can re-test review collection from
    an existing main output without changing that output.
 
@@ -29,14 +32,26 @@ npm run start:safe
 # Optional independent review diagnostic from the saved locations.
 npm run recon:reviews
 
-# Independent CLIP classification and OCR of the saved photo URLs.
+# One-time setup before the first PaddleOCR analysis.
+npm run setup:paddleocr
+
+# Independent CLIP classification and PaddleOCR of the saved photo URLs.
 npm run analyze:photos
+
+# Convert a PaddleOCR result into evidence-backed structured menu candidates.
+npm run parse:menu-ocr -- "output\paddleocr\my-test\paddleocr-analysis.json"
+
+# Manually categorize unresolved OCR price lines in a local browser.
+npm run label:menu-ocr
 
 # Manual image-category and optional OCR-text validation.
 npm run label:photos
 
 # Accuracy, precision, recall, F1, confusion matrix, and optional OCR accuracy.
 npm run analyze:photos:evaluate
+
+# Optional standalone menu-photo benchmark.
+npm run recon:paddleocr -- "C:\path\to\menu-photos"
 ```
 
 The photo analysis and optional review diagnostic can run in either order after
@@ -117,6 +132,7 @@ in the output.
 ## Requirements
 
 - Node.js 20 or newer
+- Python 3.12 for PaddleOCR photo analysis (the validated Windows version)
 - Google Chrome
 - Windows PowerShell for the command examples below
 - sufficient disk space for the Chrome profile, npm packages, model caches, and
@@ -136,8 +152,20 @@ npx playwright install chromium
 ```
 
 The first photo-analysis run downloads and caches the configured CLIP model and
-Tesseract language data. Later runs reuse `.cache/transformers` and
-`.cache/tesseract`.
+the official PaddleOCR models. Later runs reuse `.cache/transformers` and the
+Paddle model cache in the current Windows user profile. Tesseract fallback runs
+continue to reuse `.cache/tesseract`.
+
+PaddleOCR is installed into an isolated `.venv-paddleocr` environment so it
+does not change the Node.js scraper dependencies. This setup is required before
+the first `npm run analyze:photos` or standalone PaddleOCR run:
+
+```powershell
+npm run setup:paddleocr
+```
+
+The first PaddleOCR run downloads its official models. Later runs reuse the
+model cache under the current Windows user profile.
 
 ## Command reference
 
@@ -155,6 +183,11 @@ Tesseract language data. Later runs reuse `.cache/transformers` and
 | `npm run analyze:photos:resume` | Resume the newest incomplete photo-analysis checkpoint. |
 | `npm run label:photos` | Open the local browser photo-labelling interface. |
 | `npm run analyze:photos:evaluate` | Recalculate photo and optional OCR metrics from saved labels. |
+| `npm run setup:paddleocr` | Create the isolated Python environment and install the pinned PaddleOCR dependencies. |
+| `npm run recon:paddleocr -- "<image-or-folder>"` | Run layout-aware PaddleOCR on one menu image or every supported image in a folder. |
+| `npm run parse:menu-ocr -- "<paddleocr-analysis.json>"` | Independently pair OCR names, descriptions, and prices using layout geometry. |
+| `npm run label:menu-ocr` | Review and categorize unpaired OCR price lines in a local browser. |
+| `npm run test:menu-parser` | Run the synthetic safety tests for menu OCR pairing and evaluation. |
 | `npm run export:excel -- output\restaurants.json` | Rebuild the client-readable Excel workbook from an existing JSON output. |
 
 ## Google Maps login
@@ -300,8 +333,13 @@ These settings can be added to `.env` or set temporarily in PowerShell:
 | `PHOTO_ANALYSIS_DTYPE` | `q8` | Quantized model type used to reduce memory. |
 | `PHOTO_ANALYSIS_DEVICE` | `cpu` | Inference device; CPU is the validated setting. |
 | `PHOTO_ANALYSIS_MODEL_CACHE` | `.cache/transformers` | Downloaded model cache. |
-| `PHOTO_ANALYSIS_OCR_LANGUAGES` | `eng+msa` | Tesseract OCR languages. |
-| `PHOTO_ANALYSIS_OCR_CACHE` | `.cache/tesseract` | OCR language-data cache. |
+| `PHOTO_ANALYSIS_OCR_ENGINE` | `paddleocr` | OCR engine for new runs; use `tesseract` only for fallback or an older checkpoint. |
+| `PHOTO_ANALYSIS_OCR_IMAGE_SIZE` | `1800` | Maximum dimension downloaded after a photo is classified as a menu. |
+| `PHOTO_ANALYSIS_PADDLE_PYTHON` | `.venv-paddleocr/Scripts/python.exe` | Python executable created by `npm run setup:paddleocr`. |
+| `PHOTO_ANALYSIS_PADDLE_MODEL_SIZE` | `small` | PP-OCRv6 `tiny`, `small`, or `medium` detection and recognition models. |
+| `PHOTO_ANALYSIS_PADDLE_CPU_THREADS` | `4` | CPU threads available to the PaddleOCR worker. |
+| `PHOTO_ANALYSIS_OCR_LANGUAGES` | `eng+msa` | Tesseract fallback languages. |
+| `PHOTO_ANALYSIS_OCR_CACHE` | `.cache/tesseract` | Tesseract fallback language-data cache. |
 | `PHOTO_ANALYSIS_IMAGE_SIZE` | `1280` | Maximum classification image dimension. |
 | `PHOTO_ANALYSIS_REQUEST_TIMEOUT_MS` | `30000` | Photo download timeout in milliseconds. |
 | `PHOTO_ANALYSIS_DELAY_MS` | `250` | Delay between photos. |
@@ -1082,9 +1120,12 @@ the result was unknown or below the configured thresholds.
 
 ### OCR method and status
 
-Only images whose automatic final category is `menu` are passed to Tesseract.
-The source is rotated, resized up to 1800 by 1800, converted to grayscale,
-normalized, sharpened, and recognized with the configured languages.
+Only images whose automatic final category is `menu` are passed to OCR. New
+runs use one persistent PaddleOCR worker with the PP-OCRv6 small models. The
+worker preserves text boxes, polygons, confidence and conservative price
+candidates. A separate image copy up to 1800 pixels is downloaded only for menu
+photos. Set `PHOTO_ANALYSIS_OCR_ENGINE=tesseract` to reproduce the older
+grayscale/normalized Tesseract path.
 
 - `ocr.status: "success"`: OCR returned non-empty text.
 - `ocr.status: "none"`: OCR ran but returned no usable text.
@@ -1092,9 +1133,155 @@ normalized, sharpened, and recognized with the configured languages.
 - `ocr: null`: OCR was not attempted because the automatic category was not
   `menu`.
 
+New PaddleOCR records also contain `ocr.engine`, `ocr.modelSize`, positioned
+`ocr.lines`, `ocr.priceCandidates`, and `ocr.elapsedSeconds`. Existing
+Tesseract result folders are not rewritten or deleted. A resumed checkpoint
+must use the same OCR engine with which it started, preventing mixed results.
+
 Manual category corrections do not retroactively run OCR. An actual menu photo
 that CLIP predicted as food, interior, or unknown still has no OCR result unless
 the analyzer logic or thresholds are changed and the photos are analyzed again.
+
+### Optional PaddleOCR menu-photo runner
+
+`src/paddleocr-menu.py` serves both as the persistent PaddleOCR worker used by
+`src/analyze-photos.js` and as an independent evaluation path for folders of
+menu photos. It does not modify the main scrape output. Existing Tesseract
+results and the 1,496-photo evaluation remain reproducible by selecting the
+Tesseract fallback engine.
+
+After the one-time setup, run one image or every supported image in a folder:
+
+```powershell
+npm run setup:paddleocr
+npm run recon:paddleocr -- "output\ocr-handover-2026-11-10\evaluation-20"
+```
+
+Useful optional arguments are:
+
+```powershell
+npm run recon:paddleocr -- "C:\path\to\photos" `
+  --output-dir "output\paddleocr\my-test" `
+  --model-size small `
+  --save-visualizations
+```
+
+The runner uses the CPU-oriented PP-OCRv6 small detection and recognition
+models by default. Windows MKLDNN is deliberately disabled because the tested
+PaddlePaddle 3.3.1 build failed during PP-OCRv6 inference with it enabled.
+
+Each `paddleocr-analysis.json` contains:
+
+- per-image `success`, `none`, or `failed` status and elapsed time;
+- ordered text lines with confidence, bounding box, and polygon;
+- combined raw OCR text; and
+- conservative price candidates with source line, confidence, box, displayed
+  text, numeric value, and currency only when `RM` or `MYR` was explicit.
+
+Numeric-only price candidates intentionally retain `currency: null`; the runner
+never guesses currency. These candidates are not yet structured menu dishes and
+must be paired with nearby names using the saved coordinates. Candidate count is
+also not an accuracy measurement: correct, wrong, and missed prices require
+human-verified ground truth.
+
+On the 20-photo test set prepared on 10 November 2026, the runner completed
+20/20 images with no failures. It recognized 1,546 text lines and emitted 480
+price candidates. OCR inference took 280.329 seconds in total, averaging 14.016
+seconds per photo with a 12.779-second median. The complete command took 361.845
+seconds including model startup, output writing, and visualization overhead.
+This is an observed benchmark, not a guaranteed runtime or price-accuracy score.
+
+### Structured menu-photo parsing
+
+`src/parse-menu-ocr.py` converts a completed `paddleocr-analysis.json` into
+structured menu candidates without changing the main scraper or photo analyzer.
+Layout geometry is the primary signal: prices are treated as anchors, price
+columns are detected, and candidate names must align within the same column.
+Vertically stacked product cards use a stricter left-edge alignment rule.
+
+Fuzzy matching is not used to decide which price belongs to an item. It is only
+an optional validation step against a supplied typed-menu catalog, and the raw
+OCR name is always preserved. The parser never fills a missing price or currency
+and retains ambiguous or unpaired evidence for review.
+
+Run the parser on a PaddleOCR output:
+
+```powershell
+npm run parse:menu-ocr -- `
+  "output\paddleocr\menu-20-2026-11-10\paddleocr-analysis.json" `
+  --output-dir "output\menu-ocr-parsing\my-run"
+```
+
+Optional typed-menu validation uses the format in
+`config/menu-ocr-typed-menu.example.json`:
+
+```powershell
+npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
+  --typed-menu "config\my-typed-menu.json"
+```
+
+Human-verified evaluation uses the generated `ground-truth-template.json` or
+the format in `config/menu-ocr-ground-truth.example.json`:
+
+```powershell
+npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
+  --ground-truth "config\menu-ocr-ground-truth.json"
+```
+
+Each timestamped parser output contains:
+
+- `structured-menu.json`: full items, multi-price variants, confidence, status,
+  source line indexes, boxes, optional typed-menu matches, and image summaries;
+- `structured-menu.csv`: one reader-friendly row per structured price;
+- `ambiguous-items.json`: plausible pairings whose top alternatives were too
+  close to call safely;
+- `unpaired-lines.json`: price and text evidence that was not paired reliably;
+- `evaluation.json`: correct, wrong, and missed price/pair metrics when verified
+  ground truth is supplied; and
+- `ground-truth-template.json`: empty human-verification template. Never copy
+  predictions into it without checking the source photo.
+
+Item fields include `section`, `name`, `description`, the single-price fields,
+`prices[]` for variants, `status`, confidence, an optional `typedMenuMatch`, and
+evidence line indexes. Single-price fields stay `null` when multiple prices are
+shown rather than choosing one arbitrarily.
+
+On the current 20-photo baseline, the conservative parser produced 345 item
+candidates, marked 20 ambiguous, and retained 45 price lines as unpaired. These
+figures measure parser coverage only. Accuracy remains `not_evaluated` until the
+20 source photos have human-verified expected prices and name-price pairs.
+
+### Categorizing unpaired menu prices
+
+Run the local review interface after parsing:
+
+```powershell
+npm run label:menu-ocr
+```
+
+It selects the newest `structured-menu.json` under
+`output/menu-ocr-parsing`, opens `http://127.0.0.1:3792`, and shows the source
+photo with the unresolved OCR line highlighted. You can classify a line as an
+item price, price variant, add-on price, bundle price, not a price, duplicate,
+unreadable, or unknown. Any category that creates menu data requires a manually
+verified item name, displayed price text, and numeric price. Currency can remain
+empty and is never inferred.
+
+Each choice is saved atomically to
+`config/menu-ocr-unpaired-labels.json`. Rerun the parser to apply the reviewed
+evidence:
+
+```powershell
+npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
+  --unpaired-labels "config\menu-ocr-unpaired-labels.json" `
+  --output-dir "output\menu-ocr-parsing\reviewed-run"
+```
+
+Verified item, variant, add-on, and bundle labels are merged into the structured
+output with `humanVerified: true` and confidence `1.0`. `not_a_price` and
+`duplicate` resolve the evidence without creating an item. `unreadable` and
+`unknown` remain unresolved. The original OCR line and the complete review label
+are retained for audit.
 
 ### Checkpoint and output details
 

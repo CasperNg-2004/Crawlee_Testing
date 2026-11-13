@@ -143,8 +143,13 @@ function flattenPhotoRecords(value) {
         categoryScores: image.categoryScores || null,
         sourceTabs: Array.isArray(image.sourceTabs) ? image.sourceTabs : [],
         analysisStatus: image.analysisStatus || null,
+        ocrEngine: image.ocr?.engine || (image.ocr ? 'tesseract' : null),
         ocrStatus: image.ocr?.status || null,
         ocrConfidence: numberOrNull(image.ocr?.confidence),
+        ocrPriceCandidateCount: Array.isArray(image.ocr?.priceCandidates)
+          ? image.ocr.priceCandidates.length
+          : null,
+        ocrElapsedSeconds: numberOrNull(image.ocr?.elapsedSeconds),
         ocrText: image.ocr?.text || null,
         originalWidth: numberOrNull(image.originalWidth),
         originalHeight: numberOrNull(image.originalHeight),
@@ -524,7 +529,15 @@ const HTML = String.raw`<!doctype html>
       elements.fullSize.href = record.fullSizeImageUrl;
       elements.expectedOcr.value = record.expectedOcrText || '';
       elements.ocrText.textContent = record.ocrText || 'No OCR text';
-      elements.ocrMeta.textContent = record.ocrStatus ? record.ocrStatus + (record.ocrConfidence == null ? '' : ' · ' + Math.round(record.ocrConfidence) + '%') : 'not attempted';
+      elements.ocrMeta.textContent = record.ocrStatus
+        ? [
+            record.ocrEngine || 'OCR',
+            record.ocrStatus,
+            record.ocrConfidence == null ? null : Math.round(record.ocrConfidence) + '% confidence',
+            record.ocrPriceCandidateCount == null ? null : record.ocrPriceCandidateCount + ' price candidates',
+            record.ocrElapsedSeconds == null ? null : record.ocrElapsedSeconds + 's',
+          ].filter(Boolean).join(' · ')
+        : 'not attempted';
       elements.chips.replaceChildren(...[
         record.actualCategory ? 'Saved: ' + record.actualCategory : 'Unlabelled',
         'Confidence: ' + (record.confidenceLevel || 'n.a.'),

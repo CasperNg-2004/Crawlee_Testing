@@ -1,0 +1,14 @@
+{
+  "images": {
+    "example-menu.jpg": [
+      {
+        "section": "Coffee",
+        "name": "Spanish Latte"
+      },
+      {
+        "section": "Non-Coffee",
+        "name": "Matcha Latte"
+      }
+    ]
+  }
+}

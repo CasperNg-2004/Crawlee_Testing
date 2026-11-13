@@ -1,0 +1,18 @@
+{
+  "images": [
+    {
+      "fileName": "example-menu.jpg",
+      "expectedPrices": [12.9, 15.9],
+      "items": [
+        {
+          "name": "Spanish Latte",
+          "prices": [12.9]
+        },
+        {
+          "name": "Matcha Latte",
+          "prices": [15.9]
+        }
+      ]
+    }
+  ]
+}

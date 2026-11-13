@@ -17,6 +17,11 @@
     "analyze:photos:resume": "node --env-file=.env src/analyze-photos.js --resume",
     "analyze:photos:evaluate": "node --env-file=.env src/analyze-photos.js --evaluate-only",
     "label:photos": "node --env-file=.env src/label-photos.js",
+    "setup:paddleocr": "python -m venv .venv-paddleocr && .venv-paddleocr\\Scripts\\python.exe -m pip install --upgrade pip && .venv-paddleocr\\Scripts\\python.exe -m pip install -r requirements-paddleocr.txt",
+    "recon:paddleocr": ".venv-paddleocr\\Scripts\\python.exe src/paddleocr-menu.py",
+    "parse:menu-ocr": ".venv-paddleocr\\Scripts\\python.exe src/parse-menu-ocr.py",
+    "label:menu-ocr": "node --env-file=.env src/label-menu-ocr-unpaired.js",
+    "test:menu-parser": "python -m unittest discover -s test -p test_menu_ocr_parser.py",
     "export:photos": "node --env-file=.env src/export-photo-list.js",
     "export:excel": "node --env-file=.env src/export-excel.js",
     "test": "node --test"

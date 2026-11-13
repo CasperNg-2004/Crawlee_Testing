@@ -8,9 +8,12 @@
 // Recalculate accuracy after filling config/photo-analysis-labels.csv:
 //   npm run analyze:photos:evaluate
 
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { basename, join, resolve } from 'node:path';
 import process from 'node:process';
+import { createInterface } from 'node:readline';
 import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
 import { env, pipeline, RawImage } from '@huggingface/transformers';
@@ -51,6 +54,12 @@ const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'out
 const labelsPath = resolve(process.env.PHOTO_ANALYSIS_LABELS?.trim() || 'config/photo-analysis-labels.csv');
 const modelCacheDir = resolve(process.env.PHOTO_ANALYSIS_MODEL_CACHE?.trim() || '.cache/transformers');
 const ocrCacheDir = resolve(process.env.PHOTO_ANALYSIS_OCR_CACHE?.trim() || '.cache/tesseract');
+const ocrEngine = (process.env.PHOTO_ANALYSIS_OCR_ENGINE?.trim() || 'paddleocr').toLowerCase();
+const paddlePythonPath = resolve(process.env.PHOTO_ANALYSIS_PADDLE_PYTHON?.trim()
+  || '.venv-paddleocr/Scripts/python.exe');
+const paddleModelSize = process.env.PHOTO_ANALYSIS_PADDLE_MODEL_SIZE?.trim().toLowerCase() || 'small';
+const paddleCpuThreads = positiveInteger(process.env.PHOTO_ANALYSIS_PADDLE_CPU_THREADS, 4);
+const ocrImageSize = positiveInteger(process.env.PHOTO_ANALYSIS_OCR_IMAGE_SIZE, 1800);
 const modelId = process.env.PHOTO_ANALYSIS_MODEL?.trim() || 'Xenova/clip-vit-base-patch32';
 const modelDtype = process.env.PHOTO_ANALYSIS_DTYPE?.trim() || 'q8';
 const device = process.env.PHOTO_ANALYSIS_DEVICE?.trim() || 'cpu';
@@ -69,6 +78,13 @@ const requestedPlaceNames = (process.env.PHOTO_ANALYSIS_PLACES?.trim() || '')
   .split('|')
   .map((name) => name.trim().toLowerCase())
   .filter(Boolean);
+
+if (!['paddleocr', 'tesseract'].includes(ocrEngine)) {
+  throw new Error('PHOTO_ANALYSIS_OCR_ENGINE must be "paddleocr" or "tesseract".');
+}
+if (!['tiny', 'small', 'medium'].includes(paddleModelSize)) {
+  throw new Error('PHOTO_ANALYSIS_PADDLE_MODEL_SIZE must be "tiny", "small", or "medium".');
+}
 
 env.cacheDir = modelCacheDir;
 env.allowRemoteModels = true;
@@ -104,13 +120,20 @@ async function runAnalysis() {
   const report = resumedRun
     ? JSON.parse(await readFile(partialPath, 'utf8'))
     : createEmptyReport(startedAt);
+  const checkpointOcrEngine = report.settings?.ocrEngine || 'tesseract';
+  if (resumedRun && checkpointOcrEngine !== ocrEngine) {
+    throw new Error(
+      `Cannot resume a ${checkpointOcrEngine} checkpoint with PHOTO_ANALYSIS_OCR_ENGINE=${ocrEngine}. `
+      + `Set the engine to ${checkpointOcrEngine} or start a new run.`,
+    );
+  }
   report.status = 'running';
   report.resumedAt = resumedRun ? startedAt.toISOString() : null;
 
   const completedKeys = new Set(report.restaurants.map(placeKey));
   const pendingPlaces = selectedPlaces.filter((place) => !completedKeys.has(placeKey(place)));
   console.log(`Photo analysis: ${selectedPlaces.length} restaurant(s), up to ${maxPhotosPerPlace} photos each.`);
-  console.log(`Model: ${modelId} (${modelDtype}, ${device}); OCR: ${ocrLanguages.join('+')}.`);
+  console.log(`Model: ${modelId} (${modelDtype}, ${device}); OCR: ${ocrEngine}.`);
   console.log(`Output: ${runRoot}`);
   if (resumedRun) console.log(`Resuming with ${completedKeys.size} restaurant(s) already complete.`);
 
@@ -119,9 +142,16 @@ async function runAnalysis() {
   }
 
   let classifier = null;
-  let ocrWorker = null;
+  let ocrRunner = null;
   try {
     if (pendingPlaces.length) {
+      if (ocrEngine === 'paddleocr') {
+        await access(paddlePythonPath).catch(() => {
+          throw new Error(
+            `PaddleOCR Python was not found at ${paddlePythonPath}. Run npm run setup:paddleocr first.`,
+          );
+        });
+      }
       console.log('Loading image classification model. The first run downloads and caches its files.');
       classifier = await pipeline('zero-shot-image-classification', modelId, {
         dtype: modelDtype,
@@ -141,15 +171,13 @@ async function runAnalysis() {
       for (const [photoIndex, photo] of photos.entries()) {
         const prefix = `  [${photoIndex + 1}/${photos.length}]`;
         const result = await analyzePhoto(photo, classifier, async () => {
-          if (!ocrWorker) {
-            console.log('  Starting the reusable OCR worker. Language files are cached after first use.');
-            ocrWorker = await createWorker(ocrLanguages.join('+'), 1, {
-              cachePath: ocrCacheDir,
-              logger: ocrProgressLogger(),
-            });
-            await ocrWorker.setParameters({ preserve_interword_spaces: '1' });
+          if (!ocrRunner) {
+            console.log(`  Starting the reusable ${ocrEngine} OCR worker.`);
+            ocrRunner = ocrEngine === 'paddleocr'
+              ? await createPaddleOcrRunner(join(runRoot, '.paddleocr-temp'))
+              : await createTesseractOcrRunner();
           }
-          return ocrWorker;
+          return ocrRunner;
         });
         imageResults.push(result);
         const ocrText = result.ocr?.status === 'success'
@@ -169,7 +197,7 @@ async function runAnalysis() {
       console.log(`  Saved checkpoint (${pendingIndex + 1}/${pendingPlaces.length} pending complete).`);
     }
   } finally {
-    await ocrWorker?.terminate().catch(() => {});
+    await ocrRunner?.terminate().catch(() => {});
     await classifier?.dispose?.().catch(() => {});
   }
 
@@ -237,30 +265,22 @@ async function analyzePhoto(photo, classifier, getOcrWorker) {
 
     if (result.category === 'menu') {
       try {
-        const ocrInput = await sharp(downloaded.buffer, { failOn: 'warning' })
-          .rotate()
-          .resize({ width: 1800, height: 1800, fit: 'inside', withoutEnlargement: true })
-          .grayscale()
-          .normalize()
-          .sharpen()
-          .png()
-          .toBuffer();
-        const worker = await getOcrWorker();
-        const recognized = await worker.recognize(ocrInput, { rotateAuto: true });
-        const text = cleanOcrText(recognized.data.text);
-        result.ocr = {
-          status: text ? 'success' : 'none',
-          languages: ocrLanguages,
-          confidence: numberOrNull(recognized.data.confidence),
-          text: text || null,
-          error: null,
-        };
+        const ocrUrl = makeResizedGoogleImageUrl(sourceUrl, ocrImageSize);
+        const ocrDownloaded = ocrUrl === base.analysisImageUrl
+          ? downloaded
+          : await downloadImage(ocrUrl, requestTimeoutMs);
+        const runner = await getOcrWorker();
+        result.ocr = await runner.recognize(ocrDownloaded.buffer);
       } catch (error) {
         result.ocr = {
           status: 'failed',
-          languages: ocrLanguages,
+          engine: ocrEngine,
+          languages: ocrEngine === 'tesseract' ? ocrLanguages : null,
           confidence: null,
           text: null,
+          lines: null,
+          priceCandidates: null,
+          elapsedSeconds: null,
           error: conciseError(error),
         };
       }
@@ -269,6 +289,159 @@ async function analyzePhoto(photo, classifier, getOcrWorker) {
   } catch (error) {
     return { ...base, error: conciseError(error) };
   }
+}
+
+async function createTesseractOcrRunner() {
+  const worker = await createWorker(ocrLanguages.join('+'), 1, {
+    cachePath: ocrCacheDir,
+    logger: ocrProgressLogger(),
+  });
+  await worker.setParameters({ preserve_interword_spaces: '1' });
+  return {
+    async recognize(buffer) {
+      const started = Date.now();
+      const ocrInput = await sharp(buffer, { failOn: 'warning' })
+        .rotate()
+        .resize({ width: ocrImageSize, height: ocrImageSize, fit: 'inside', withoutEnlargement: true })
+        .grayscale()
+        .normalize()
+        .sharpen()
+        .png()
+        .toBuffer();
+      const recognized = await worker.recognize(ocrInput, { rotateAuto: true });
+      const text = cleanOcrText(recognized.data.text);
+      return {
+        status: text ? 'success' : 'none',
+        engine: 'tesseract',
+        languages: ocrLanguages,
+        confidence: numberOrNull(recognized.data.confidence),
+        text: text || null,
+        lines: null,
+        priceCandidates: null,
+        elapsedSeconds: round((Date.now() - started) / 1_000, 3),
+        error: null,
+      };
+    },
+    async terminate() {
+      await worker.terminate();
+    },
+  };
+}
+
+async function createPaddleOcrRunner(tempDir) {
+  await mkdir(tempDir, { recursive: true });
+  const scriptPath = resolve('src/paddleocr-menu.py');
+  const child = spawn(paddlePythonPath, [
+    scriptPath,
+    '--worker',
+    '--model-size', paddleModelSize,
+    '--cpu-threads', String(paddleCpuThreads),
+    '--max-side', String(ocrImageSize),
+  ], {
+    cwd: process.cwd(),
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  });
+  const pending = new Map();
+  let ready = false;
+  let closed = false;
+  let readyResolve;
+  let readyReject;
+  const readyPromise = new Promise((resolveReady, rejectReady) => {
+    readyResolve = resolveReady;
+    readyReject = rejectReady;
+  });
+  const output = createInterface({ input: child.stdout });
+  const errors = [];
+
+  output.on('line', (line) => {
+    if (line.startsWith('PADDLEOCR_WORKER_READY ')) {
+      ready = true;
+      readyResolve();
+      return;
+    }
+    if (!line.startsWith('PADDLEOCR_WORKER_RESULT ')) return;
+    try {
+      const message = JSON.parse(line.slice('PADDLEOCR_WORKER_RESULT '.length));
+      const request = pending.get(String(message.id));
+      if (!request) return;
+      pending.delete(String(message.id));
+      request.resolve(normalizePaddleOcrResult(message.result));
+    } catch (error) {
+      console.warn(`  PaddleOCR returned an invalid response: ${conciseError(error)}`);
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    const message = String(chunk).trim();
+    if (message) errors.push(message);
+  });
+  child.on('error', (error) => {
+    closed = true;
+    if (!ready) readyReject(error);
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  });
+  child.on('exit', (code) => {
+    closed = true;
+    const detail = errors.join(' ').replace(/\s+/g, ' ').trim();
+    const error = new Error(
+      `PaddleOCR worker exited with code ${code}${detail ? `: ${detail.slice(-500)}` : '.'}`,
+    );
+    if (!ready) readyReject(error);
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  });
+
+  await readyPromise;
+  return {
+    async recognize(buffer) {
+      if (closed) throw new Error('PaddleOCR worker is not running.');
+      const requestId = randomUUID();
+      const imagePath = join(tempDir, `${requestId}.jpg`);
+      await writeFile(imagePath, buffer);
+      try {
+        const resultPromise = new Promise((resolveResult, rejectResult) => {
+          pending.set(requestId, { resolve: resolveResult, reject: rejectResult });
+        });
+        child.stdin.write(`${JSON.stringify({
+          id: requestId,
+          action: 'recognize',
+          inputPath: imagePath,
+        })}\n`);
+        return await resultPromise;
+      } finally {
+        await rm(imagePath, { force: true }).catch(() => {});
+      }
+    },
+    async terminate() {
+      if (!closed) {
+        child.stdin.write(`${JSON.stringify({ action: 'shutdown' })}\n`);
+        child.stdin.end();
+      }
+      output.close();
+      await rm(tempDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function normalizePaddleOcrResult(result) {
+  const text = cleanOcrText(result?.text);
+  const failed = result?.status === 'failed';
+  return {
+    status: failed ? 'failed' : text ? 'success' : 'none',
+    engine: 'paddleocr',
+    languages: null,
+    modelSize: paddleModelSize,
+    confidence: result?.meanConfidence == null
+      ? null
+      : round(Number(result.meanConfidence) * 100, 3),
+    text: text || null,
+    lines: Array.isArray(result?.lines) ? result.lines : [],
+    priceCandidates: Array.isArray(result?.priceCandidates) ? result.priceCandidates : [],
+    elapsedSeconds: numberOrNull(result?.elapsedSeconds),
+    error: result?.error || null,
+  };
 }
 
 function classifyPredictions(predictions) {
@@ -310,8 +483,11 @@ function combineRestaurantResult(place, images, elapsedMs) {
     .filter((image) => image.ocr?.text)
     .map((image) => ({
       photoId: image.photoId,
+      engine: image.ocr.engine || 'tesseract',
       confidence: image.ocr.confidence,
       text: image.ocr.text,
+      lines: image.ocr.lines || null,
+      priceCandidates: image.ocr.priceCandidates || null,
     }));
   return {
     name: place.name ?? null,
@@ -331,6 +507,7 @@ function combineRestaurantResult(place, images, elapsedMs) {
       elapsedMs,
     },
     menuOcr: {
+      engine: ocrEngine,
       status: byCategory.menu.length
         ? menuTexts.length ? 'success' : 'none'
         : 'not_applicable',
@@ -364,7 +541,11 @@ function createEmptyReport(startedAt) {
       imageSize,
       minimumCategoryScore,
       minimumCategoryMargin,
-      ocrLanguages,
+      ocrEngine,
+      ocrLanguages: ocrEngine === 'tesseract' ? ocrLanguages : null,
+      ocrImageSize,
+      paddleModelSize: ocrEngine === 'paddleocr' ? paddleModelSize : null,
+      paddleCpuThreads: ocrEngine === 'paddleocr' ? paddleCpuThreads : null,
       processingConcurrency: 1,
     },
     confidenceNotice: 'CLIP scores rank the supplied prompts and are not calibrated probabilities.',

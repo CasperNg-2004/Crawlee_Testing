@@ -7,4 +7,7 @@ storage-*/
 google-auth-state.json
 .chrome-profile/
 .cache/
+.venv-paddleocr/
+__pycache__/
+*.py[cod]
 *.log
