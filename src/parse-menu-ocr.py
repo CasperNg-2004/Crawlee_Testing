@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -20,6 +21,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import median
 from typing import Any
+from urllib.parse import unquote
 
 SRC_DIRECTORY = Path(__file__).resolve().parent
 if str(SRC_DIRECTORY) not in sys.path:
@@ -57,14 +59,13 @@ def main() -> int:
     args = parse_args()
     input_path = Path(args.input).resolve()
     source = read_json(input_path)
-    if not isinstance(source.get("images"), list):
-        raise SystemExit(f"{input_path} must contain a PaddleOCR images array.")
+    source_images, source_info = parser_images_from_source(source, input_path)
 
     typed_catalog = load_typed_catalog(args.typed_menu)
     ground_truth = load_ground_truth(args.ground_truth)
     unpaired_labels = load_unpaired_labels(args.unpaired_labels)
     output_dir = stage_output_directory(
-        Path("output") / "photo-analysis",
+        Path(os.environ.get("OUTPUT_ROOT", "output")),
         "menu-parsing",
         explicit=args.output_dir,
         source=input_path,
@@ -72,7 +73,7 @@ def main() -> int:
 
     started = time.perf_counter()
     parsed_images = []
-    for index, image in enumerate(source["images"], start=1):
+    for index, image in enumerate(source_images, start=1):
         file_name = str(image.get("fileName") or f"image-{index}")
         parsed = parse_image(
             image,
@@ -83,7 +84,7 @@ def main() -> int:
         )
         parsed_images.append(parsed)
         print(
-            f"[{index}/{len(source['images'])}] {file_name}: "
+            f"[{index}/{len(source_images)}] {file_name}: "
             f"items={parsed['counts']['items']} "
             f"ambiguous={parsed['counts']['ambiguousItems']} "
             f"unpairedPrices={parsed['counts']['unpairedPriceLines']}",
@@ -110,6 +111,7 @@ def main() -> int:
             else None,
             "pairingMethod": "column_aware_spatial_price_anchor",
             "fuzzyMatchingPurpose": "optional_typed_menu_validation_only",
+            **source_info,
         },
         "counts": aggregate_counts(parsed_images),
         "evaluation": evaluation,
@@ -140,9 +142,15 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pair PaddleOCR menu text and prices using layout geometry."
+        description="Pair saved PaddleOCR menu text and prices using layout geometry."
     )
-    parser.add_argument("input", help="PaddleOCR paddleocr-analysis.json file.")
+    parser.add_argument(
+        "input",
+        help=(
+            "PaddleOCR paddleocr-analysis.json or integrated "
+            "photo-classification photo-analysis.json file."
+        ),
+    )
     parser.add_argument("--output-dir", help="Directory for structured outputs.")
     parser.add_argument(
         "--typed-menu",
@@ -161,6 +169,106 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fuzzy-threshold", type=ratio, default=0.82)
     return parser.parse_args()
+
+
+def parser_images_from_source(
+    source: dict[str, Any], input_path: Path
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if isinstance(source.get("images"), list):
+        return source["images"], {
+            "inputFormat": "standalone_paddleocr",
+            "photoLabelsPath": None,
+            "photoSelection": "all_source_images",
+        }
+
+    restaurants = source.get("restaurants")
+    if not isinstance(restaurants, list):
+        raise SystemExit(
+            f"{input_path} must contain either a PaddleOCR images array or "
+            "photo-classification restaurants array."
+        )
+
+    labels_path = input_path.parent.parent / "csv" / "photo-analysis-labels.csv"
+    labels = load_photo_category_labels(labels_path)
+    use_manual_labels = bool(labels)
+    images: list[dict[str, Any]] = []
+    for restaurant in restaurants:
+        place_id = classification_place_id(restaurant)
+        restaurant_name = clean_text(restaurant.get("name"))
+        for image in restaurant.get("images") or []:
+            photo_id = clean_text(image.get("photoId"))
+            actual_category = labels.get(photo_id or "")
+            selected = (
+                actual_category == "menu"
+                if use_manual_labels
+                else image.get("category") == "menu"
+            )
+            if not selected:
+                continue
+            ocr = image.get("ocr") if isinstance(image.get("ocr"), dict) else {}
+            ocr_status = ocr.get("status")
+            if ocr_status not in SUPPORTED_STATUSES:
+                ocr_status = "failed"
+            error = ocr.get("error")
+            if not ocr:
+                error = (
+                    "OCR was not run because this manually confirmed menu photo "
+                    "was not selected as menu by the classifier."
+                )
+            file_name = (
+                f"{place_id}__{photo_id}.jpg"
+                if place_id and photo_id
+                else f"{photo_id or 'unknown-photo'}.jpg"
+            )
+            images.append(
+                {
+                    "inputPath": image.get("originalFullSizeImageUrl")
+                    or image.get("analysisImageUrl"),
+                    "fileName": file_name,
+                    "restaurantName": restaurant_name,
+                    "placeId": place_id,
+                    "photoId": photo_id,
+                    "status": ocr_status,
+                    "elapsedSeconds": ocr.get("elapsedSeconds"),
+                    "lineCount": len(ocr.get("lines") or []),
+                    "meanConfidence": ocr.get("confidence"),
+                    "text": ocr.get("text"),
+                    "lines": ocr.get("lines") or [],
+                    "priceCandidates": ocr.get("priceCandidates") or [],
+                    "error": error,
+                }
+            )
+
+    return images, {
+        "inputFormat": "integrated_photo_classification",
+        "photoLabelsPath": str(labels_path) if use_manual_labels else None,
+        "photoSelection": "manual_menu_labels" if use_manual_labels else "predicted_menu",
+    }
+
+
+def load_photo_category_labels(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = csv.DictReader(handle)
+        return {
+            clean_text(row.get("photoId")) or "":
+            (clean_text(row.get("actualCategory")) or "").lower()
+            for row in rows
+            if clean_text(row.get("photoId"))
+            and clean_text(row.get("actualCategory"))
+        }
+
+
+def classification_place_id(restaurant: dict[str, Any]) -> str | None:
+    explicit = clean_text(restaurant.get("placeId"))
+    if explicit:
+        return explicit
+    maps_url = clean_text(restaurant.get("googleMapsUrl"))
+    if not maps_url:
+        return None
+    match = re.search(r"(?:!19s|%2119s)(ChIJ[^!&/?%]+)", maps_url)
+    return unquote(match.group(1)) if match else None
 
 
 def parse_image(
@@ -347,6 +455,9 @@ def parse_image(
     return {
         "fileName": file_name,
         "inputPath": image.get("inputPath"),
+        "restaurantName": image.get("restaurantName"),
+        "placeId": image.get("placeId"),
+        "photoId": image.get("photoId"),
         "status": image_status,
         "canvas": {
             "ocrExtentWidth": round(canvas_width, 3),
@@ -1278,6 +1389,9 @@ def empty_image_result(
     return {
         "fileName": file_name,
         "inputPath": source.get("inputPath"),
+        "restaurantName": source.get("restaurantName"),
+        "placeId": source.get("placeId"),
+        "photoId": source.get("photoId"),
         "status": status if status in SUPPORTED_STATUSES else "failed",
         "canvas": None,
         "sections": [],

@@ -1,10 +1,13 @@
 import importlib.util
+import csv
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "parse-menu-ocr.py"
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "src" / "parse-menu-ocr.py"
 SPEC = importlib.util.spec_from_file_location("parse_menu_ocr", MODULE_PATH)
 PARSER = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PARSER
@@ -25,6 +28,48 @@ def image(lines):
 
 
 class MenuOcrParserTests(unittest.TestCase):
+    def test_reads_integrated_classification_with_run_specific_menu_labels(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "test") as temporary:
+            classification = Path(temporary) / "photo-classification"
+            input_path = classification / "json" / "photo-analysis.json"
+            labels_path = classification / "csv" / "photo-analysis-labels.csv"
+            input_path.parent.mkdir(parents=True)
+            labels_path.parent.mkdir(parents=True)
+            with labels_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["photoId", "actualCategory"])
+                writer.writeheader()
+                writer.writerow({"photoId": "menu-photo", "actualCategory": "menu"})
+                writer.writerow({"photoId": "food-photo", "actualCategory": "food"})
+
+            source = {
+                "restaurants": [
+                    {
+                        "name": "Test Cafe",
+                        "googleMapsUrl": "https://www.google.com/maps/place/Test/data=!19sChIJTest",
+                        "images": [
+                            {
+                                "photoId": "menu-photo",
+                                "category": "food",
+                                "originalFullSizeImageUrl": "https://example.com/menu.jpg",
+                                "ocr": None,
+                            },
+                            {
+                                "photoId": "food-photo",
+                                "category": "menu",
+                                "ocr": {"status": "success", "lines": []},
+                            },
+                        ],
+                    }
+                ]
+            }
+            images, settings = PARSER.parser_images_from_source(source, input_path)
+
+            self.assertEqual(len(images), 1)
+            self.assertEqual(images[0]["photoId"], "menu-photo")
+            self.assertEqual(images[0]["placeId"], "ChIJTest")
+            self.assertEqual(images[0]["status"], "failed")
+            self.assertEqual(settings["photoSelection"], "manual_menu_labels")
+
     def test_pairs_two_columns_without_crossing(self):
         result = PARSER.parse_image(
             image(

@@ -29,7 +29,12 @@ import { flattenPhotoList, photoListToCsv } from './photo-export.js';
 import { exportRestaurantsToExcel } from './excel-export.js';
 import { extractGoogleReviews, normalizeReviewSort } from './review-scraper.js';
 import { classifyGoogleSafetyState, isSuspiciousEmptyMenu } from './safety.js';
-import { createOutputRun, ensureOutputTypes, outputFile } from './output-paths.js';
+import {
+  createPipelineRun,
+  ensureOutputTypes,
+  ensurePipelineStage,
+  outputFile,
+} from './output-paths.js';
 
 let runSummaryPrinted = false;
 process.on('uncaughtException', (error) => {
@@ -43,7 +48,7 @@ process.on('uncaughtException', (error) => {
       failed: null,
       safetyStop: null,
       error: error?.message || String(error),
-      outputDir: process.env.OUTPUT_RUN_DIR?.trim() || process.env.OUTPUT_DIR?.trim() || 'output/scraper',
+      outputDir: process.env.OUTPUT_RUN_DIR?.trim() || process.env.OUTPUT_ROOT?.trim() || 'output',
     })}`);
   }
   process.exit(1);
@@ -72,10 +77,10 @@ const maxPlaces = onePlaceMode ? 1 : positiveInteger(process.env.MAX_PLACES, 100
 const maxStalledScrolls = positiveInteger(process.env.MAX_STALLED_SCROLLS, 12);
 const scrollWaitMs = positiveInteger(process.env.SCROLL_WAIT_MS, 2_000);
 const headless = process.env.HEADLESS?.toLowerCase() !== 'false';
-const outputBaseDir = resolve(process.env.OUTPUT_DIR?.trim() || 'output/scraper');
+const outputRoot = resolve(process.env.OUTPUT_ROOT?.trim() || 'output');
 const outputDir = process.env.OUTPUT_RUN_DIR?.trim()
   ? await ensureOutputTypes(resolve(process.env.OUTPUT_RUN_DIR.trim()))
-  : await createOutputRun(outputBaseDir);
+  : await ensurePipelineStage(await createPipelineRun(outputRoot), 'scraper');
 const jsonOutputDir = join(outputDir, 'json');
 const csvOutputDir = join(outputDir, 'csv');
 const chromeProfileDir = resolve(process.env.CHROME_PROFILE_DIR?.trim() || '.chrome-profile');

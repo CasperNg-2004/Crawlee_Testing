@@ -15,6 +15,7 @@
     "analyze:photos:resume": "node --env-file=.env src/analyze-photos.js --resume",
     "analyze:photos:evaluate": "node --env-file=.env src/analyze-photos.js --evaluate-only",
     "label:photos": "node --env-file=.env src/label-photos.js",
+    "label:ocr": "cross-env PHOTO_LABEL_MODE=ocr node --env-file=.env src/label-photos.js",
     "setup:paddleocr": "python -m venv .venv-paddleocr && .venv-paddleocr\\Scripts\\python.exe -m pip install --upgrade pip && .venv-paddleocr\\Scripts\\python.exe -m pip install -r requirements-paddleocr.txt",
     "recon:paddleocr": ".venv-paddleocr\\Scripts\\python.exe src/paddleocr-menu.py",
     "parse:menu-ocr": ".venv-paddleocr\\Scripts\\python.exe src/parse-menu-ocr.py",

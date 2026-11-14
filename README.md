@@ -18,7 +18,8 @@ The current workflow has three clearly separated sections:
    supports manual price review, and compares photo menus with typed menus.
 
 The classification and analysis stages do not modify the selected scraper
-`restaurants.json`. Every command writes into a dated and timed run folder.
+`restaurants.json`. A new scrape creates `Running#1`, then `Running#2`, and so
+on; every later stage for that scrape stays inside the same numbered folder.
 
 ## End-to-end workflow
 
@@ -35,16 +36,16 @@ npm run setup:paddleocr
 npm run analyze:photos
 
 # Convert a PaddleOCR result into evidence-backed structured menu candidates.
-npm run parse:menu-ocr -- "output\photo-analysis\<date>\<time>\paddleocr\json\paddleocr-analysis.json"
+npm run parse:menu-ocr -- "output\Running#N\photo-analysis\paddleocr\json\paddleocr-analysis.json"
 
 # Manually categorize unresolved OCR price lines in a local browser.
 npm run label:menu-ocr
 
 # Build an exact file-to-place photo map for downloaded OCR images.
-npm run build:photo-map -- --selection "<selection.json>" --photo-list "output\scraper\<date>\<time>\json\photo-list.json" --output "<photo-map.csv>"
+npm run build:photo-map -- --selection "<selection.json>" --photo-list "output\Running#N\scraper\json\photo-list.json" --output "<photo-map.csv>"
 
 # Match Google typed-menu offers against structured photo-menu offers.
-npm run match:menus -- --restaurants "output\scraper\<date>\<time>\json\restaurants.json" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"
+npm run match:menus -- --restaurants "output\Running#N\scraper\json\restaurants.json" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"
 
 # Export the menu matching result to a client-readable Excel workbook.
 npm run export:report -- "<menu-matches.json>"
@@ -141,7 +142,7 @@ in the output.
 - Google Chrome
 - Windows PowerShell for the command examples below
 - sufficient disk space for the Chrome profile, npm packages, model caches, and
-  timestamped analysis results
+  numbered pipeline results
 - a stable connection to Google Maps and Google-hosted photo URLs
 
 The validated low-memory photo-analysis setup uses CPU inference with the
@@ -178,13 +179,14 @@ model cache under the current Windows user profile.
 | --- | --- |
 | `npm run login` | Open normal Chrome with the dedicated scraper profile for manual sign-in. |
 | `npm start` | Run the main scraper in one Chrome process; best for short tests. |
-| `npm run scrape:one -- "<ChIJ ID or Maps URL>"` | Skip discovery and write one object into a new dated scraper run. |
+| `npm run scrape:one -- "<ChIJ ID or Maps URL>"` | Skip discovery and write one object into a new numbered pipeline run. |
 | `npm run start:visible` | Run the main scraper with `HEADLESS=false` for this command. |
 | `npm run start:safe` | Start a fresh main scrape in restartable Chrome batches. |
 | `npm run resume:safe` | Continue the existing Crawlee queue without purging completed work. |
 | `npm run analyze:photos` | Start a new photo classification and OCR run. |
 | `npm run analyze:photos:resume` | Resume the newest incomplete photo-analysis checkpoint. |
 | `npm run label:photos` | Open the local browser photo-labelling interface. |
+| `npm run label:ocr` | Open the run-specific menu OCR correction and live character-accuracy interface. |
 | `npm run analyze:photos:evaluate` | Recalculate photo and optional OCR metrics from saved labels. |
 | `npm run setup:paddleocr` | Create the isolated Python environment and install the pinned PaddleOCR dependencies. |
 | `npm run recon:paddleocr -- "<image-or-folder>"` | Run layout-aware PaddleOCR on one menu image or every supported image in a folder. |
@@ -195,7 +197,7 @@ model cache under the current Windows user profile.
 | `npm run match:menus -- --restaurants "<restaurants.json>" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"` | Compare typed Google menu offers with structured photo-menu offers. |
 | `npm run export:report -- "<menu-matches.json>"` | Create `menu-check.xlsx` in that matching run's `xlsx` folder. |
 | `npm run test:menu-matching` | Run the matcher and Excel-report synthetic tests. |
-| `npm run test:output-paths` | Verify dated run creation, type folders, collision handling, and Python stage reuse. |
+| `npm run test:output-paths` | Verify numbered run creation, stage/type folders, run increments, and Python stage reuse. |
 | `npm run export:excel` | Rebuild Excel from the newest scraper run; an exact JSON path can be supplied after `--`. |
 
 ## Google Maps login
@@ -307,7 +309,7 @@ REVIEW_SORT=newest
 | `SAFE_BATCH_SIZE` | Number of detail pages handled before safe mode restarts Chrome. |
 | `SAFE_RESTART_DELAY_MS` | Delay between safe-mode Chrome batches. |
 | `SAFE_MAX_CONSECUTIVE_FAILURES` | Number of consecutive failed batches allowed before safe mode stops. |
-| `OUTPUT_DIR` | Main JSON, CSV, Excel, failure, and photo-list directory; defaults to `output/scraper`. |
+| `OUTPUT_ROOT` | Numbered pipeline root; defaults to `output`. Every scrape creates the next `Running#N`. |
 | `CRAWLEE_STORAGE_DIR` | Safe-run queue and dataset directory; defaults to `storage`. |
 | `MAX_REQUESTS_PER_CRAWL` | Internal per-process cap controlled by safe mode. Normally do not set it manually. |
 | `CHAIN_CLASSIFICATION_CATALOG` | Malaysia brand-count catalog; defaults to `config/malaysia-chain-counts.json`. |
@@ -318,8 +320,6 @@ REVIEW_SORT=newest
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `PHOTO_ANALYSIS_INPUT` | newest scraper run | Optional exact main JSON containing photo URLs. Leave empty for automatic newest-run selection. |
-| `PHOTO_ANALYSIS_OUTPUT_DIR` | `output/photo-classification` | Root directory for timestamped classification runs. |
-| `PHOTO_MENU_ANALYSIS_OUTPUT_DIR` | `output/photo-analysis` | Root for PaddleOCR, structured parsing, and menu-matching jobs. |
 | `PHOTO_ANALYSIS_PLACE_LIMIT` | all | Empty or `all` processes every matching location; a positive number limits a test. |
 | `PHOTO_ANALYSIS_PLACES` | empty | Optional `\|`-separated exact place names. |
 | `PHOTO_ANALYSIS_MAX_PHOTOS_PER_PLACE` | `30` | Maximum photos analyzed per location. |
@@ -339,7 +339,7 @@ REVIEW_SORT=newest
 | `PHOTO_ANALYSIS_DELAY_MS` | `250` | Delay between photos. |
 | `PHOTO_ANALYSIS_MIN_SCORE` | `0.42` | Lower top scores become `unknown`. |
 | `PHOTO_ANALYSIS_MIN_MARGIN` | `0.08` | Narrow first-versus-second margins become `unknown`. |
-| `PHOTO_ANALYSIS_LABELS` | `config/photo-analysis-labels.csv` | Manual category and optional OCR ground truth. |
+| `PHOTO_ANALYSIS_LABELS` | empty | Optional override. Empty saves manual labels inside the selected `Running#N/photo-classification/csv/` folder. |
 | `PHOTO_LABEL_PORT` | `3789` | Local browser labeller port. |
 | `PHOTO_LABEL_OPEN_BROWSER` | `true` | Automatically open the labelling interface. |
 | `PHOTO_LABEL_INPUT` | newest completed run | Optional exact `photo-analysis.json` to label. |
@@ -473,7 +473,7 @@ npm run scrape:one -- "ChIJa1yDFxRJzDERfLtufF3j-VI"
 
 This mode sets the place limit to one, skips area discovery, and writes a single
 JSON object into the new run's `json/place.json`. Normal batch mode writes its
-restaurant files into the same dated run structure.
+restaurant files into the same numbered run structure.
 
 ## Output
 
@@ -481,27 +481,29 @@ The output root is grouped by pipeline so results are easy to locate:
 
 | Folder | Contains |
 | --- | --- |
-| `output/scraper/<date>/<time>/` | Main place JSON/CSV/Excel, failures, flat photo list, and run information. |
-| `output/photo-classification/<date>/<time>/` | CLIP category results, checkpoints, category labels, and evaluation. |
-| `output/photo-analysis/<date>/<time>/` | One photo-menu job containing PaddleOCR, parsing, and matching stages. |
+| `output/Running#N/scraper/` | Main place JSON/CSV/Excel, failures, flat photo list, and run information. |
+| `output/Running#N/photo-classification/` | CLIP category results, checkpoints, category labels, and evaluation for the same scrape. |
+| `output/Running#N/photo-analysis/` | PaddleOCR, parsing, and menu-matching stages for the same scrape. |
 
 For example, a normal scraper run writes:
 
 ```text
-output/scraper/2026-11-14/14-30-25/
-  json/restaurants.json
-  json/photo-list.json
-  json/failed-restaurants.json
-  csv/restaurants.csv
-  csv/photo-list.csv
-  xlsx/restaurants.xlsx
-  other/run-summary.json
-  other/safe-run.json
+output/Running#1/
+  scraper/
+    json/restaurants.json
+    json/photo-list.json
+    json/failed-restaurants.json
+    csv/restaurants.csv
+    csv/photo-list.csv
+    xlsx/restaurants.xlsx
+    other/run-summary.json
+    other/safe-run.json
+  photo-classification/
+  photo-analysis/
 ```
 
-The date and time use the computer's local timezone. If two runs start in the
-same second, a numeric suffix is added. Every safe-run Chrome batch reuses the
-same folder, and `npm run resume:safe` reopens that preserved run.
+The next fresh scrape creates `Running#2`. Every safe-run Chrome batch reuses
+the same numbered folder, and `npm run resume:safe` reopens that preserved run.
 
 Crawlee also keeps its local dataset under `storage/datasets/default/`. Nested fields such as `menu`, `openingHours`, `popularTimes`, `peakHours`, `about`, and `contact` are stored as JSON strings inside the CSV.
 
@@ -981,7 +983,7 @@ uses quantized CLIP to classify successfully loaded images as
 English and Malay OCR worker. Original full-size URLs remain in the output,
 but resized copies are used during analysis to control memory use.
 
-Each run creates `output/photo-classification/<date>/<time>/` with:
+Photo classification writes into the current scrape's `output/Running#N/photo-classification/` folder with:
 
 - `json/photo-analysis.json`: combined restaurant results, individual image scores,
   OCR text, and run settings
@@ -1002,9 +1004,10 @@ If a run stops, resume the newest checkpoint with:
 npm run analyze:photos:resume
 ```
 
-To measure precision, copy a generated `photo-labels-template.csv` to
-`config/photo-analysis-labels.csv`, fill `actualCategory` with only `menu`,
-`food`, `interior`, or `unknown`, then run:
+To measure precision without the browser labeller, copy the selected run's
+`photo-labels-template.csv` to `photo-analysis-labels.csv` in the same
+`Running#N/photo-classification/csv/` folder. Fill `actualCategory` with only
+`menu`, `food`, `interior`, or `unknown`, then run:
 
 ```powershell
 npm run analyze:photos:evaluate
@@ -1027,9 +1030,10 @@ npm run label:photos
 It opens the newest completed photo-analysis run in the default browser at
 `http://127.0.0.1:3789`. Choose the actual category with the buttons or the
 number keys: `1` menu, `2` food, `3` interior, and `4` unknown. Each choice is
-immediately saved to `config/photo-analysis-labels.csv`, and the next
-unlabelled photo is displayed. Stop with `Ctrl+C`; the next run resumes from
-the saved labels.
+immediately saved to that run's
+`photo-classification/csv/photo-analysis-labels.csv`, and the next unlabelled
+photo is displayed. Stop with `Ctrl+C`; reopening the same run resumes from its
+saved labels without replacing labels from another `Running#N`.
 
 The interface can filter all photos, low-confidence results, predicted menu
 photos, or disagreements. It also shows model scores, Google source tabs, OCR
@@ -1110,7 +1114,7 @@ Useful optional arguments are:
 
 ```powershell
 npm run recon:paddleocr -- "C:\path\to\photos" `
-  --output-dir "output\photo-analysis\<date>\<time>\paddleocr" `
+  --output-dir "output\Running#N\photo-analysis\paddleocr" `
   --model-size small `
   --save-visualizations
 ```
@@ -1142,8 +1146,12 @@ This is an observed benchmark, not a guaranteed runtime or price-accuracy score.
 
 ### Structured menu-photo parsing
 
-`src/parse-menu-ocr.py` converts a completed `paddleocr-analysis.json` into
-structured menu candidates without changing the main scraper or photo analyzer.
+`src/parse-menu-ocr.py` converts either a completed standalone
+`paddleocr-analysis.json` or the integrated photo-classification
+`photo-analysis.json` into structured menu candidates without changing the main
+scraper or photo analyzer. For integrated input, it uses that run's manual
+labels to select confirmed menu photos, retains place/photo IDs, and reuses the
+saved OCR boxes instead of running PaddleOCR again.
 Layout geometry is the primary signal: prices are treated as anchors, price
 columns are detected, and candidate names must align within the same column.
 Vertically stacked product cards use a stricter left-edge alignment rule.
@@ -1157,7 +1165,14 @@ Run the parser on a PaddleOCR output:
 
 ```powershell
 npm run parse:menu-ocr -- `
-  "output\photo-analysis\<date>\<time>\paddleocr\json\paddleocr-analysis.json"
+  "output\Running#N\photo-analysis\paddleocr\json\paddleocr-analysis.json"
+```
+
+Or continue directly from an evaluated integrated classification run:
+
+```powershell
+npm run parse:menu-ocr -- `
+  "output\Running#N\photo-classification\json\photo-analysis.json"
 ```
 
 When the input follows the standard layout, the parser automatically writes to
@@ -1180,7 +1195,7 @@ npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
   --ground-truth "config\menu-ocr-ground-truth.json"
 ```
 
-Each timestamped parser output contains:
+Each numbered run's parser output contains:
 
 - `structured-menu.json`: full items, multi-price variants, confidence, status,
   source line indexes, boxes, optional typed-menu matches, and image summaries;
@@ -1211,8 +1226,8 @@ Run the local review interface after parsing:
 npm run label:menu-ocr
 ```
 
-It selects the newest `menu-parsing/json/structured-menu.json` under
-`output/photo-analysis`, opens `http://127.0.0.1:3792`, and shows the source
+It selects the newest `photo-analysis/menu-parsing/json/structured-menu.json`
+under `output/Running#N`, opens `http://127.0.0.1:3792`, and shows the source
 photo with the unresolved OCR line highlighted. You can classify a line as an
 item price, price variant, add-on price, bundle price, not a price, duplicate,
 unreadable, or unknown. Any category that creates menu data requires a manually
@@ -1226,7 +1241,7 @@ evidence:
 ```powershell
 npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
   --unpaired-labels "config\menu-ocr-unpaired-labels.json" `
-  --output-dir "output\photo-analysis\<date>\<time>\menu-parsing"
+  --output-dir "output\Running#N\photo-analysis\menu-parsing"
 ```
 
 Verified item, variant, add-on, and bundle labels are merged into the structured
@@ -1248,8 +1263,8 @@ links a photo by restaurant-name similarity:
 ```powershell
 npm run build:photo-map -- `
   --selection "<evaluation-selection.json>" `
-  --photo-list "output\scraper\<date>\<time>\json\photo-list.json" `
-  --output "output\photo-analysis\<date>\<time>\menu-parsing\csv\photo-map.csv"
+  --photo-list "output\Running#N\scraper\json\photo-list.json" `
+  --output "output\Running#N\photo-analysis\menu-parsing\csv\photo-map.csv"
 ```
 
 Future inputs can instead put `placeId` and `photoId` directly on each
@@ -1261,9 +1276,9 @@ Run the matcher:
 
 ```powershell
 npm run match:menus -- `
-  --restaurants "output\scraper\<date>\<time>\json\restaurants.json" `
-  --structured "output\photo-analysis\<date>\<time>\menu-parsing\json\structured-menu.json" `
-  --photo-map "output\photo-analysis\<date>\<time>\menu-parsing\csv\photo-map.csv"
+  --restaurants "output\Running#N\scraper\json\restaurants.json" `
+  --structured "output\Running#N\photo-analysis\menu-parsing\json\structured-menu.json" `
+  --photo-map "output\Running#N\photo-analysis\menu-parsing\csv\photo-map.csv"
 ```
 
 The matcher recognizes the structured input's job and writes into that same
@@ -1301,7 +1316,7 @@ Without it, coverage and agreement figures are labelled estimated.
 Create the reader-facing workbook:
 
 ```powershell
-npm run export:report -- "output\photo-analysis\<date>\<time>\menu-matching\json\menu-matches.json"
+npm run export:report -- "output\Running#N\photo-analysis\menu-matching\json\menu-matches.json"
 ```
 
 This writes `menu-matching/xlsx/menu-check.xlsx` in the same job with Summary, Items, Review,
@@ -1309,12 +1324,45 @@ Photos, Metrics, and Info sheets. Review rows contain an Excel dropdown for
 Accept, Reject, or Correct plus manual correction fields. These decisions are
 notes only in this version and are not applied back automatically.
 
+#### How to read `menu-check.xlsx`
+
+- **Summary** has one row per place. Start here to compare typed Google dishes,
+  parsed photo dishes, matched rows, differences, coverage, newest menu-photo
+  date, and the number of photos used. `Maps link` opens the place page.
+- **Items** is the complete comparison ledger. Google and photo names/prices are
+  side by side, with name/price checks, fuzzy name score, OCR confidence, photo
+  date, source image link, and the reason for each status.
+- **Review** contains only `REVIEW` and `PRICE_DIFF` rows. Use the `Decision`
+  dropdown (`Accept`, `Reject`, or `Correct`) and optionally enter corrected
+  name, corrected price, and a note. These cells are human review notes and do
+  not rewrite JSON automatically.
+- **Photos** has one row per confirmed menu image, including place/photo IDs,
+  upload date, parser status, parsed and matched item counts, ambiguous pairings,
+  unresolved price count, and the full-size image link.
+- **Metrics** explains estimated coverage/agreement values and any measured
+  ground-truth metrics. Estimated values describe the current matcher output;
+  they are not accuracy scores.
+- **Info** records input files, thresholds, assignment method, unlinked-image
+  count, status legend, and other audit information needed to reproduce the
+  workbook.
+
+Item status meanings:
+
+- `MATCH`: accepted name pairing and equal comparable price;
+- `PRICE_DIFF`: accepted name pairing but different comparable prices;
+- `PRICE_NOT_COMPARABLE`: name pairing exists but price evidence cannot be
+  compared safely;
+- `REVIEW`: uncertain name/variant/date/pairing evidence needs a person;
+- `ONLY_GOOGLE`: typed Google item had no accepted photo-menu partner; and
+- `ONLY_PHOTO`: photo-menu candidate had no accepted typed Google partner.
+
 ### Checkpoint and output details
 
 After each restaurant, the analyzer updates
 `photo-analysis.partial.json`. `npm run analyze:photos:resume` selects the newest
 incomplete folder and skips restaurant keys already present. Starting
-`npm run analyze:photos` without resume creates a new timestamped folder.
+`npm run analyze:photos` writes into the selected scraper's matching
+`Running#N/photo-classification` folder.
 
 `photo-analysis.json` contains:
 
@@ -1366,18 +1414,20 @@ OCR into the editable expected-text field. Correct that text before saving when
 OCR character accuracy is required. `Clear label` removes the current ground
 truth. `Download labels CSV` exports all current labels.
 
-Labels are saved atomically to `config/photo-analysis-labels.csv`. Existing
-labels resume when the server restarts. Windows file-lock retries and save-queue
-recovery prevent one transient error from breaking later saves. Keep the CSV
-closed in Excel while labelling. Stop the server with `Ctrl+C`; it waits for the
-active save before closing.
+Labels are saved atomically to the selected run's
+`photo-classification/csv/photo-analysis-labels.csv`. Existing labels for that
+run resume when the server restarts, and other numbered runs remain untouched.
+Windows file-lock retries and save-queue recovery prevent one transient error
+from breaking later saves. Keep the CSV closed in Excel while labelling. Stop
+the server with `Ctrl+C`; it waits for the active save before closing.
 
 ### Evaluation definitions
 
-Evaluation-only mode reads the newest completed analysis and the configured
-labels. It does not download images, load CLIP, run OCR, or rewrite the generated
-label template. It updates `evaluation.json` and the evaluation object inside
-`photo-analysis.json`.
+Evaluation-only mode reads the newest completed analysis and its own labels. If
+`PHOTO_LABEL_INPUT` identifies an exact analysis, evaluation uses that run
+instead. It does not download images, load CLIP, run OCR, or rewrite the
+generated label template. It updates `evaluation.json` and the evaluation
+object inside `photo-analysis.json`.
 
 Metrics use only valid manual labels whose photo IDs exist in that analysis:
 
@@ -1396,30 +1446,47 @@ OCR character accuracy is calculated only for labels that have both
 recognized strings using character edit distance. Category labels alone cannot
 produce an OCR accuracy score.
 
+To review OCR for a specific run in a browser, pin its classification input and
+start the OCR-only interface:
+
+```powershell
+$env:PHOTO_LABEL_INPUT='output\Running#1\photo-classification\json\photo-analysis.json'
+npm run label:ocr
+```
+
+The page shows only manually confirmed menu photos with extracted OCR. Click
+`Copy to expected`, correct the text so it exactly matches the visible menu,
+then save. Progress and mean character accuracy update immediately. Corrections
+autosave to the same run's
+`photo-classification/csv/photo-analysis-labels.csv`. After reviewing the chosen
+sample or all images, stop with `Ctrl+C` and persist the metric into the JSON:
+
+```powershell
+npm run analyze:photos:evaluate
+Remove-Item Env:PHOTO_LABEL_INPUT
+```
+
 ### Current verified photo evaluation
 
-All 1,496 analyzed images were manually labelled:
+`Running#1` contains 600 manually labelled images:
 
 | Actual category | Labelled images | Precision | Recall | F1 |
 | --- | ---: | ---: | ---: | ---: |
-| Menu | 86 | 32.9% | 90.7% | 48.3% |
-| Food | 854 | 97.4% | 73.8% | 83.9% |
-| Interior | 393 | 85.5% | 88.5% | 87.0% |
-| Unknown | 163 | 40.5% | 50.9% | 45.1% |
+| Menu | 130 | 66.8% | 96.2% | 78.9% |
+| Food | 297 | 97.4% | 75.1% | 84.8% |
+| Interior | 155 | 99.3% | 92.3% | 95.7% |
+| Unknown | 18 | 30.0% | 66.7% | 41.4% |
 
-Overall accuracy is 76.1%, macro precision is 64.1%, macro recall is 76.0%,
-and macro F1 is 66.1%.
+Overall accuracy is 83.8%, macro precision is 73.4%, macro recall is 82.5%,
+and macro F1 is 75.2%.
 
-The automatic model predicted 237 menu, 647 food, 407 interior, and 205 unknown
-images. It correctly identified 78 of the 86 actual menu photos, giving high
-menu recall. However, 159 non-menu images were predicted as menu, producing low
-menu precision. The model is useful for finding menu candidates but still needs
-human confirmation.
+The automatic model predicted 187 menu, 229 food, 144 interior, and 40 unknown
+images. It correctly identified 125 of the 130 actual menu photos. Manual labels
+remain the authority for deciding which images enter structured menu parsing.
 
-OCR ran on the 237 automatically predicted menu images. It returned non-empty
-text for 235 and empty text for 2. The other 1,259 images were not sent to OCR.
-OCR character accuracy is currently `not_evaluated` because no manually
-corrected `expectedOcrText` values were supplied.
+OCR returned non-empty text for 125 manually confirmed menu photos. OCR
+character accuracy remains `not_evaluated` until corrected `expectedOcrText`
+values are saved through `npm run label:ocr`.
 
 ### Checking analyzed OCR text
 
@@ -1588,7 +1655,7 @@ src/
   google-ui-utils.js    Shared Google consent interaction
   excel-utils.js        Shared Excel sheet formatting
   local-tool-utils.js   Shared local labeller HTTP and file helpers
-  output-paths.js       Shared dated/type-based JavaScript output layout
+  output-paths.js       Shared numbered-run/type-based JavaScript output layout
   output_paths.py       Shared photo-analysis Python output layout
 
 config/
@@ -1596,20 +1663,17 @@ config/
   photo-analysis-labels.csv
 
 output/
-  scraper/<date>/<time>/
-    json/
-    csv/
-    xlsx/
-    other/
-  photo-classification/<date>/<time>/
-    json/
-    csv/
-    xlsx/
-    other/
-  photo-analysis/<date>/<time>/
-    paddleocr/{json,csv,xlsx,other}/
-    menu-parsing/{json,csv,xlsx,other}/
-    menu-matching/{json,csv,xlsx,other}/
+  Running#1/
+    scraper/{json,csv,xlsx,other}/
+    photo-classification/{json,csv,xlsx,other}/
+    photo-analysis/
+      paddleocr/{json,csv,xlsx,other}/
+      menu-parsing/{json,csv,xlsx,other}/
+      menu-matching/{json,csv,xlsx,other}/
+  Running#2/
+    scraper/{json,csv,xlsx,other}/
+    photo-classification/{json,csv,xlsx,other}/
+    photo-analysis/
 
 storage/                Crawlee queue and dataset state
 .chrome-profile/        Sensitive dedicated Google profile

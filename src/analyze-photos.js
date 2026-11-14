@@ -1,5 +1,5 @@
 // Independent photo analyzer for the Google Maps photo metadata already saved
-// in the newest output/scraper/<date>/<time>/json/restaurants.json. This file
+// in the newest output/Running#N/scraper/json/restaurants.json. This file
 // does not launch or modify the scraper.
 //
 // Run a two-place test (default):
@@ -28,11 +28,17 @@ import {
   sleep,
 } from './common-utils.js';
 import {
-  createOutputRun,
+  createPipelineRun,
+  ensurePipelineStage,
+  findLatestPipelineFile,
+  findLatestPipelineRun,
   findLatestOutputFile,
   findLatestOutputRun,
+  listPipelineRuns,
   listOutputRuns,
   outputFile,
+  outputRunForFile,
+  pipelineRunForFile,
 } from './output-paths.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
@@ -67,16 +73,24 @@ const args = new Set(process.argv.slice(2));
 const resume = args.has('--resume');
 const evaluateOnly = args.has('--evaluate-only');
 const explicitInputPath = process.env.PHOTO_ANALYSIS_INPUT?.trim();
+const pipelineOutputRoot = resolve(process.env.OUTPUT_ROOT?.trim() || 'output');
 const inputPath = explicitInputPath
   ? resolve(explicitInputPath)
-  : await findLatestOutputFile('output/scraper', [
+  : await findLatestPipelineFile(pipelineOutputRoot, [
+    'scraper/json/restaurants.json',
+    'scraper/json/restaurants-classified.json',
+  ]) || await findLatestOutputFile('output/scraper', [
     'json/restaurants.json',
     'json/restaurants-classified.json',
     'restaurants.json',
   ]);
 if (!inputPath) throw new Error('No scraper restaurants.json output was found for photo classification.');
-const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification');
-const labelsPath = resolve(process.env.PHOTO_ANALYSIS_LABELS?.trim() || 'config/photo-analysis-labels.csv');
+const legacyOutputRoot = resolve(
+  process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification',
+);
+const explicitLabelsPath = process.env.PHOTO_ANALYSIS_LABELS?.trim()
+  ? resolve(process.env.PHOTO_ANALYSIS_LABELS.trim())
+  : null;
 const modelCacheDir = resolve(process.env.PHOTO_ANALYSIS_MODEL_CACHE?.trim() || '.cache/transformers');
 const ocrCacheDir = resolve(process.env.PHOTO_ANALYSIS_OCR_CACHE?.trim() || '.cache/tesseract');
 const ocrEngine = (process.env.PHOTO_ANALYSIS_OCR_ENGINE?.trim() || 'paddleocr').toLowerCase();
@@ -114,7 +128,7 @@ if (!['tiny', 'small', 'medium'].includes(paddleModelSize)) {
 env.cacheDir = modelCacheDir;
 env.allowRemoteModels = true;
 
-await mkdir(outputRoot, { recursive: true });
+await mkdir(pipelineOutputRoot, { recursive: true });
 await mkdir(modelCacheDir, { recursive: true });
 await mkdir(ocrCacheDir, { recursive: true });
 
@@ -136,8 +150,11 @@ async function runAnalysis() {
   const selectedPlaces = placeLimit == null ? matchingPlaces : matchingPlaces.slice(0, placeLimit);
   if (!selectedPlaces.length) throw new Error(`No places with photos were found in ${inputPath}.`);
 
-  const resumedRun = resume ? await findLatestIncompleteRun() : null;
-  const runRoot = resumedRun || await createOutputRun(outputRoot);
+  const sourcePipelineRun = pipelineRunForFile(inputPath);
+  const resumedRun = resume ? await findLatestIncompleteRun(sourcePipelineRun) : null;
+  const targetPipelineRun = sourcePipelineRun || await createPipelineRun(pipelineOutputRoot);
+  const runRoot = resumedRun || await ensurePipelineStage(targetPipelineRun, 'photo-classification');
+  const labelsPath = labelsPathForRun(runRoot);
   const partialPath = outputFile(runRoot, 'json', 'photo-analysis.partial.json');
   const finalPath = outputFile(runRoot, 'json', 'photo-analysis.json');
   const startedAt = new Date();
@@ -230,7 +247,7 @@ async function runAnalysis() {
   report.updatedAt = report.finishedAt;
   report.counts = calculateCounts(report.restaurants);
   const labels = await loadGroundTruth(labelsPath);
-  report.evaluation = evaluatePredictions(report.restaurants, labels);
+  report.evaluation = evaluatePredictions(report.restaurants, labels, labelsPath);
   await writeJson(finalPath, report);
   await writeJson(partialPath, report);
   await writeJson(outputFile(runRoot, 'json', 'evaluation.json'), report.evaluation);
@@ -599,7 +616,7 @@ function calculateCounts(restaurants) {
   };
 }
 
-function evaluatePredictions(restaurants, labels) {
+function evaluatePredictions(restaurants, labels, labelsPath) {
   const predictions = new Map(restaurants
     .flatMap((restaurant) => restaurant.images || [])
     .filter((image) => image.analysisStatus === 'success' && image.photoId)
@@ -682,12 +699,19 @@ function evaluatePredictions(restaurants, labels) {
 }
 
 async function runEvaluationOnly() {
-  const runRoot = await findLatestRun('photo-analysis.json');
-  if (!runRoot) throw new Error(`No completed photo-analysis.json was found under ${outputRoot}.`);
-  const finalPath = await existingRunFile(runRoot, 'photo-analysis.json');
+  const explicitEvaluationInput = process.env.PHOTO_LABEL_INPUT?.trim();
+  const runRoot = explicitEvaluationInput
+    ? outputRunForFile(resolve(explicitEvaluationInput))
+    : await findLatestRun('photo-analysis.json');
+  if (!runRoot) throw new Error(`No completed photo-analysis.json was found under ${pipelineOutputRoot}.`);
+  const finalPath = explicitEvaluationInput
+    ? resolve(explicitEvaluationInput)
+    : await existingRunFile(runRoot, 'photo-analysis.json');
+  if (!await fileExists(finalPath)) throw new Error(`Photo analysis input was not found: ${finalPath}`);
+  const labelsPath = labelsPathForRun(runRoot);
   const report = JSON.parse(await readFile(finalPath, 'utf8'));
   const labels = await loadGroundTruth(labelsPath);
-  report.evaluation = evaluatePredictions(report.restaurants || [], labels);
+  report.evaluation = evaluatePredictions(report.restaurants || [], labels, labelsPath);
   report.updatedAt = new Date().toISOString();
   await writeJson(finalPath, report);
   await writeJson(outputFile(runRoot, 'json', 'evaluation.json'), report.evaluation);
@@ -699,6 +723,10 @@ async function runEvaluationOnly() {
   console.log(`Accuracy: ${formatPercent(report.evaluation.accuracy)}`);
   console.log(`Macro precision: ${formatPercent(report.evaluation.macroPrecision)}`);
   console.log(`Updated: ${finalPath}`);
+}
+
+function labelsPathForRun(runRoot) {
+  return explicitLabelsPath || outputFile(runRoot, 'csv', 'photo-analysis-labels.csv');
 }
 
 async function downloadImage(url, timeoutMs) {
@@ -792,11 +820,25 @@ async function writeFileWithRetry(path, contents, attempts = 10) {
 }
 
 async function findLatestRun(filename) {
-  return findLatestOutputRun(outputRoot, [`json/${filename}`, filename]);
+  const pipelineRun = await findLatestPipelineRun(
+    pipelineOutputRoot,
+    [`photo-classification/json/${filename}`, `photo-classification/${filename}`],
+  );
+  if (pipelineRun) return ensurePipelineStage(pipelineRun, 'photo-classification');
+  return findLatestOutputRun(legacyOutputRoot, [`json/${filename}`, filename]);
 }
 
-async function findLatestIncompleteRun() {
-  for (const candidate of await listOutputRuns(outputRoot)) {
+async function findLatestIncompleteRun(sourcePipelineRun = null) {
+  const candidates = [];
+  if (sourcePipelineRun) {
+    candidates.push(await ensurePipelineStage(sourcePipelineRun, 'photo-classification'));
+  } else {
+    for (const pipelineRun of await listPipelineRuns(pipelineOutputRoot)) {
+      candidates.push(await ensurePipelineStage(pipelineRun, 'photo-classification'));
+    }
+    candidates.push(...await listOutputRuns(legacyOutputRoot));
+  }
+  for (const candidate of candidates) {
     const partialPath = await existingRunFile(candidate, 'photo-analysis.partial.json');
     const finalPath = await existingRunFile(candidate, 'photo-analysis.json');
     if (!partialPath || finalPath) continue;

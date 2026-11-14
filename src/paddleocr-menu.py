@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -47,7 +48,7 @@ def main() -> int:
         raise SystemExit(f"No supported images found at {input_path}")
 
     output_dir = stage_output_directory(
-        Path("output") / "photo-analysis",
+        Path(os.environ.get("OUTPUT_ROOT", "output")),
         "paddleocr",
         explicit=args.output_dir,
     )

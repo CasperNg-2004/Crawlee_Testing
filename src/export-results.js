@@ -5,6 +5,7 @@ import { flattenPhotoList, photoListToCsv } from './photo-export.js';
 import {
   ensureOutputTypes,
   findLatestOutputFile,
+  findLatestPipelineFile,
   outputFile,
   outputRunForFile,
 } from './output-paths.js';
@@ -19,7 +20,10 @@ const inputEnvironment = mode === 'excel'
   : process.env.PHOTO_LIST_INPUT?.trim();
 const inputPath = inputArgument || inputEnvironment
   ? resolve(inputArgument || inputEnvironment)
-  : await findLatestOutputFile('output/scraper', [
+  : await findLatestPipelineFile(process.env.OUTPUT_ROOT?.trim() || 'output', [
+    'scraper/json/restaurants.json',
+    'scraper/json/restaurants-classified.json',
+  ]) || await findLatestOutputFile('output/scraper', [
     'json/restaurants.json',
     'json/restaurants-classified.json',
     'restaurants.json',

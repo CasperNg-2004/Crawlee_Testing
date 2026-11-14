@@ -708,7 +708,7 @@ def main() -> int:
     config_path = Path(args.config).resolve()
     ground_truth_path = Path(args.ground_truth).resolve() if args.ground_truth else None
     output_dir = stage_output_directory(
-        ROOT / "output" / "photo-analysis",
+        Path(os.environ.get("OUTPUT_ROOT", str(ROOT / "output"))),
         "menu-matching",
         explicit=args.output_dir,
         source=structured_path,

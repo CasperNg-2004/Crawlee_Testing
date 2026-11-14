@@ -21,20 +21,37 @@ import {
   sendJson,
   writeFileWithRetry,
 } from './local-tool-utils.js';
-import { findLatestOutputFile } from './output-paths.js';
+import {
+  findLatestOutputFile,
+  findLatestPipelineFile,
+  outputFile,
+  outputRunForFile,
+} from './output-paths.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const host = '127.0.0.1';
 const port = positiveInteger(process.env.PHOTO_LABEL_PORT, 3789);
-const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification');
+const labelMode = (process.env.PHOTO_LABEL_MODE?.trim() || 'classification').toLowerCase();
+if (!['classification', 'ocr'].includes(labelMode)) {
+  throw new Error('PHOTO_LABEL_MODE must be "classification" or "ocr".');
+}
+const outputRoot = resolve(process.env.OUTPUT_ROOT?.trim() || 'output');
+const legacyOutputRoot = resolve(
+  process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification',
+);
 const explicitInput = process.env.PHOTO_LABEL_INPUT?.trim();
-const labelsPath = resolve(process.env.PHOTO_ANALYSIS_LABELS?.trim() || 'config/photo-analysis-labels.csv');
 const shouldOpenBrowser = booleanValue(process.env.PHOTO_LABEL_OPEN_BROWSER, true);
 
 const inputPath = explicitInput
   ? resolve(explicitInput)
-  : await findLatestCompletedAnalysis(outputRoot);
+  : await findLatestPipelineFile(outputRoot, [
+    'photo-classification/json/photo-analysis.json',
+    'photo-classification/photo-analysis.json',
+  ]) || await findLatestCompletedAnalysis(legacyOutputRoot);
 if (!inputPath) throw new Error(`No completed photo-analysis.json was found under ${outputRoot}.`);
+const labelsPath = process.env.PHOTO_ANALYSIS_LABELS?.trim()
+  ? resolve(process.env.PHOTO_ANALYSIS_LABELS.trim())
+  : outputFile(outputRunForFile(inputPath), 'csv', 'photo-analysis-labels.csv');
 
 const report = JSON.parse(await readFile(inputPath, 'utf8'));
 const records = flattenPhotoRecords(report);
@@ -86,7 +103,12 @@ const server = createServer(async (request, response) => {
         expectedOcrText: cleanText(body.expectedOcrText) || '',
       });
       await queueSave();
-      return sendJson(response, 200, { ok: true, labelled: labels.size, total: records.length });
+      return sendJson(response, 200, {
+        ok: true,
+        labelled: labels.size,
+        total: records.length,
+        ocrEvaluation: ocrEvaluationSummary(),
+      });
     }
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/label/')) {
       const photoId = decodeURIComponent(url.pathname.slice('/api/label/'.length));
@@ -106,7 +128,7 @@ export { server };
 
 server.listen(port, host, () => {
   const url = `http://${host}:${port}`;
-  console.log(`Photo labeller ready: ${url}`);
+  console.log(`${labelMode === 'ocr' ? 'OCR accuracy reviewer' : 'Photo labeller'} ready: ${url}`);
   console.log(`Input: ${inputPath}`);
   console.log(`Photos: ${records.length}; already labelled: ${labels.size}`);
   console.log(`Autosave: ${labelsPath}`);
@@ -123,18 +145,66 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 function buildState() {
+  const ocrEvaluation = ocrEvaluationSummary();
   return {
+    mode: labelMode,
     inputFile: basename(inputPath),
     labelsFile: basename(labelsPath),
     categories: CATEGORIES,
     total: records.length,
     labelled: labels.size,
+    ocrEligible: ocrEvaluation.eligibleImages,
+    ocrReviewed: ocrEvaluation.labelledImages,
+    ocrMeanCharacterAccuracy: ocrEvaluation.meanCharacterAccuracy,
     records: records.map((record) => ({
       ...record,
       actualCategory: labels.get(record.photoId)?.actualCategory || null,
       expectedOcrText: labels.get(record.photoId)?.expectedOcrText || '',
     })),
   };
+}
+
+function ocrEvaluationSummary() {
+  const eligible = records.filter((record) =>
+    labels.get(record.photoId)?.actualCategory === 'menu' && record.ocrText);
+  const reviewed = eligible.filter((record) => labels.get(record.photoId)?.expectedOcrText);
+  const accuracies = reviewed.map((record) => {
+    const expected = normalizeEvaluationText(labels.get(record.photoId).expectedOcrText);
+    const actual = normalizeEvaluationText(record.ocrText);
+    if (!expected && !actual) return 1;
+    return 1 - (levenshteinDistance(expected, actual) / Math.max(expected.length, actual.length));
+  });
+  return {
+    eligibleImages: eligible.length,
+    labelledImages: reviewed.length,
+    meanCharacterAccuracy: accuracies.length
+      ? accuracies.reduce((sum, value) => sum + value, 0) / accuracies.length
+      : null,
+  };
+}
+
+function normalizeEvaluationText(value) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function levenshteinDistance(left, right) {
+  if (!left.length) return right.length;
+  if (!right.length) return left.length;
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const substitution = previous[rightIndex - 1]
+        + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1);
+      current[rightIndex] = Math.min(
+        previous[rightIndex] + 1,
+        current[rightIndex - 1] + 1,
+        substitution,
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
 }
 
 function flattenPhotoRecords(value) {
@@ -288,7 +358,7 @@ const HTML = String.raw`<!doctype html>
 </head>
 <body>
   <header>
-    <div><h1>Photo category labeller</h1><div id="fileInfo" class="muted">Loading analysis…</div></div>
+    <div><h1 id="pageTitle">Photo category labeller</h1><div id="fileInfo" class="muted">Loading analysis…</div></div>
     <div class="progress-wrap"><strong id="progressText">0 / 0 labelled</strong><div class="progress"><div id="progressBar"></div></div></div>
   </header>
   <main>
@@ -300,6 +370,9 @@ const HTML = String.raw`<!doctype html>
           <option value="low">Low confidence</option>
           <option value="menu">Predicted menu</option>
           <option value="disagreement">Label disagreements</option>
+          <option value="ocr-unreviewed">OCR awaiting correction</option>
+          <option value="ocr-all">All menu photos with OCR</option>
+          <option value="ocr-reviewed">OCR corrections completed</option>
         </select>
         <input id="search" type="search" placeholder="Filter restaurant name">
         <span id="filteredCount" class="muted"></span>
@@ -323,8 +396,8 @@ const HTML = String.raw`<!doctype html>
         <strong>Model prediction: <span id="prediction"></span></strong>
         <div id="scores" class="scores"></div>
       </div>
-      <strong>Choose the actual category</strong>
-      <div class="labels">
+      <div id="categoryPrompt"><strong>Choose the actual category</strong></div>
+      <div id="categoryButtons" class="labels">
         <button class="label menu" data-category="menu">1 · Menu</button>
         <button class="label food" data-category="food">2 · Food</button>
         <button class="label interior" data-category="interior">3 · Interior</button>
@@ -341,12 +414,12 @@ const HTML = String.raw`<!doctype html>
         <a id="fullSize" class="link-button" target="_blank" rel="noreferrer">Open full size</a>
         <a href="/api/export" class="link-button">Download labels CSV</a>
       </div>
-      <div class="shortcuts">Keyboard: 1 Menu · 2 Food · 3 Interior · 4 Unknown · ← Previous · → Next · S Skip. Every category choice autosaves.</div>
+      <div id="shortcuts" class="shortcuts">Keyboard: 1 Menu · 2 Food · 3 Interior · 4 Unknown · ← Previous · → Next · S Skip. Every category choice autosaves.</div>
     </aside>
   </main>
   <script>
-    const state = { all: [], filtered: [], index: 0, total: 0, labelled: 0, saving: false };
-    const elements = Object.fromEntries(['fileInfo','progressText','progressBar','filter','search','filteredCount','loading','photo','imageError','previous','skip','next','position','restaurant','meta','chips','prediction','scores','expectedOcr','ocrMeta','ocrText','status','saveText','clearLabel','fullSize','copyOcr'].map(id => [id, document.getElementById(id)]));
+    const state = { all: [], filtered: [], index: 0, total: 0, labelled: 0, mode: 'classification', ocrEligible: 0, ocrReviewed: 0, ocrMeanCharacterAccuracy: null, saving: false };
+    const elements = Object.fromEntries(['pageTitle','fileInfo','progressText','progressBar','filter','search','filteredCount','loading','photo','imageError','previous','skip','next','position','restaurant','meta','chips','prediction','scores','categoryPrompt','categoryButtons','expectedOcr','ocrMeta','ocrText','status','saveText','clearLabel','fullSize','copyOcr','shortcuts'].map(id => [id, document.getElementById(id)]));
 
     init().catch(error => setStatus(error.message, true));
 
@@ -357,6 +430,19 @@ const HTML = String.raw`<!doctype html>
       state.all = data.records;
       state.total = data.total;
       state.labelled = data.labelled;
+      state.mode = data.mode;
+      state.ocrEligible = data.ocrEligible;
+      state.ocrReviewed = data.ocrReviewed;
+      state.ocrMeanCharacterAccuracy = data.ocrMeanCharacterAccuracy;
+      if (state.mode === 'ocr') {
+        elements.pageTitle.textContent = 'OCR character accuracy reviewer';
+        elements.filter.value = 'ocr-unreviewed';
+        elements.categoryPrompt.style.display = 'none';
+        elements.categoryButtons.style.display = 'none';
+        elements.clearLabel.style.display = 'none';
+        elements.saveText.textContent = 'Save corrected OCR text';
+        elements.shortcuts.textContent = 'Correct the extracted text exactly as shown in the photo, save, then use ← and → to navigate. S skips the current photo.';
+      }
       elements.fileInfo.textContent = data.inputFile + ' · autosaves to ' + data.labelsFile;
       updateProgress();
       applyFilter(true);
@@ -371,10 +457,15 @@ const HTML = String.raw`<!doctype html>
         if (filter === 'low') return record.confidenceLevel === 'low';
         if (filter === 'menu') return record.predictedCategory === 'menu';
         if (filter === 'disagreement') return record.actualCategory && record.actualCategory !== record.predictedCategory;
+        if (filter === 'ocr-unreviewed') return record.actualCategory === 'menu' && record.ocrText && !record.expectedOcrText;
+        if (filter === 'ocr-all') return record.actualCategory === 'menu' && record.ocrText;
+        if (filter === 'ocr-reviewed') return record.actualCategory === 'menu' && record.ocrText && record.expectedOcrText;
         return true;
       });
       if (jumpToFirstUnlabelled) {
-        const first = state.filtered.findIndex(record => !record.actualCategory);
+        const first = state.filtered.findIndex(record => state.mode === 'ocr'
+          ? !record.expectedOcrText
+          : !record.actualCategory);
         state.index = first >= 0 ? first : 0;
       } else {
         state.index = Math.min(state.index, Math.max(0, state.filtered.length - 1));
@@ -452,6 +543,11 @@ const HTML = String.raw`<!doctype html>
         record.actualCategory = category;
         record.expectedOcrText = elements.expectedOcr.value.trim();
         if (wasUnlabelled) state.labelled = result.labelled;
+        if (result.ocrEvaluation) {
+          state.ocrEligible = result.ocrEvaluation.eligibleImages;
+          state.ocrReviewed = result.ocrEvaluation.labelledImages;
+          state.ocrMeanCharacterAccuracy = result.ocrEvaluation.meanCharacterAccuracy;
+        }
         updateProgress();
         if (advance) advanceAfterSave(record.photoId);
         else render();
@@ -463,7 +559,7 @@ const HTML = String.raw`<!doctype html>
     }
 
     function advanceAfterSave(photoId) {
-      if (elements.filter.value === 'unlabelled') {
+      if (elements.filter.value === 'unlabelled' || elements.filter.value === 'ocr-unreviewed') {
         const oldIndex = state.index;
         state.filtered = state.filtered.filter(record => record.photoId !== photoId);
         state.index = Math.min(oldIndex, Math.max(0, state.filtered.length - 1));
@@ -501,8 +597,13 @@ const HTML = String.raw`<!doctype html>
 
     function current() { return state.filtered[state.index] || null; }
     function updateProgress() {
-      const percentage = state.total ? (state.labelled / state.total) * 100 : 0;
-      elements.progressText.textContent = state.labelled + ' / ' + state.total + ' labelled (' + percentage.toFixed(1) + '%)';
+      const completed = state.mode === 'ocr' ? state.ocrReviewed : state.labelled;
+      const total = state.mode === 'ocr' ? state.ocrEligible : state.total;
+      const percentage = total ? (completed / total) * 100 : 0;
+      const accuracy = state.mode === 'ocr' && Number.isFinite(state.ocrMeanCharacterAccuracy)
+        ? ' · character accuracy ' + (state.ocrMeanCharacterAccuracy * 100).toFixed(1) + '%'
+        : '';
+      elements.progressText.textContent = completed + ' / ' + total + (state.mode === 'ocr' ? ' OCR reviewed (' : ' labelled (') + percentage.toFixed(1) + '%)' + accuracy;
       elements.progressBar.style.width = percentage + '%';
     }
     function percent(value) { return Number.isFinite(value) ? Math.round(value * 1000) / 10 + '%' : 'n.a.'; }

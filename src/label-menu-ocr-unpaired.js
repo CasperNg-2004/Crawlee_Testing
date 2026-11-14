@@ -19,7 +19,7 @@ import {
   sendJson,
   writeFileWithRetry,
 } from './local-tool-utils.js';
-import { findLatestOutputFile } from './output-paths.js';
+import { findLatestOutputFile, findLatestPipelineFile } from './output-paths.js';
 
 const CATEGORIES = [
   'item_price',
@@ -36,7 +36,10 @@ const ACTIONABLE_CATEGORIES = new Set([
 ]);
 const host = '127.0.0.1';
 const port = positiveInteger(process.env.MENU_OCR_LABEL_PORT, 3792);
-const outputRoot = resolve(process.env.PHOTO_MENU_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-analysis');
+const outputRoot = resolve(process.env.OUTPUT_ROOT?.trim() || 'output');
+const legacyOutputRoot = resolve(
+  process.env.PHOTO_MENU_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-analysis',
+);
 const explicitInput = process.env.MENU_OCR_LABEL_INPUT?.trim();
 const labelsPath = resolve(
   process.env.MENU_OCR_UNPAIRED_LABELS?.trim() || 'config/menu-ocr-unpaired-labels.json',
@@ -45,7 +48,10 @@ const shouldOpenBrowser = booleanValue(process.env.MENU_OCR_LABEL_OPEN_BROWSER, 
 
 const inputPath = explicitInput
   ? await resolveInput(explicitInput)
-  : await findLatestStructuredMenu(outputRoot);
+  : await findLatestPipelineFile(outputRoot, [
+    'photo-analysis/menu-parsing/json/structured-menu.json',
+    'photo-analysis/menu-parsing/structured-menu.json',
+  ]) || await findLatestStructuredMenu(legacyOutputRoot);
 if (!inputPath) throw new Error(`No structured-menu.json was found under ${outputRoot}.`);
 
 const report = JSON.parse(await readFile(inputPath, 'utf8'));

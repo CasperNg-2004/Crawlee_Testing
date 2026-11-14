@@ -16,12 +16,18 @@ class OutputPathsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / "test") as temporary:
             root = Path(temporary)
             job = create_job_root(root, datetime(2026, 11, 14, 9, 8, 7))
-            paddle = stage_output_directory(root, "paddleocr", source=None, explicit=str(job / "paddleocr"))
+            self.assertEqual(job, root / "Running#1")
+            paddle = stage_output_directory(
+                root,
+                "paddleocr",
+                source=None,
+                explicit=str(job / "photo-analysis" / "paddleocr"),
+            )
             source = typed_output(paddle, "json", "paddleocr-analysis.json")
             source.write_text("{}\n", encoding="utf-8")
 
             parser = stage_output_directory(root, "menu-parsing", source=source)
-            self.assertEqual(parser, job / "menu-parsing")
+            self.assertEqual(parser, job / "photo-analysis" / "menu-parsing")
             for output_type in ("json", "csv", "xlsx", "other"):
                 self.assertTrue((parser / output_type).is_dir())
 

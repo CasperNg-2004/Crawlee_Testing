@@ -1,36 +1,42 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  createOutputRun,
-  findLatestOutputFile,
+  createPipelineRun,
+  findLatestPipelineFile,
   outputFile,
   outputRunForFile,
 } from '../src/output-paths.js';
 
-test('creates local date/time runs with typed output folders', async () => {
+test('creates a numbered pipeline with all three stages', async () => {
   const root = await mkdtemp(join(process.cwd(), 'test', 'output-layout-'));
   try {
-    const run = await createOutputRun(root, new Date(2026, 10, 14, 9, 8, 7));
-    assert.equal(run, join(root, '2026-11-14', '09-08-07'));
-    const jsonPath = outputFile(run, 'json', 'restaurants.json');
+    const pipeline = await createPipelineRun(root);
+    assert.equal(pipeline, join(root, 'Running#1'));
+    const scraper = join(pipeline, 'scraper');
+    const jsonPath = outputFile(scraper, 'json', 'restaurants.json');
     await writeFile(jsonPath, '[]\n', 'utf8');
-    assert.equal(outputRunForFile(jsonPath), run);
-    assert.equal(await findLatestOutputFile(root, 'json/restaurants.json'), jsonPath);
+    assert.equal(outputRunForFile(jsonPath), scraper);
+    assert.equal(
+      await findLatestPipelineFile(root, 'scraper/json/restaurants.json'),
+      jsonPath,
+    );
+    for (const stage of ['scraper', 'photo-classification', 'photo-analysis']) {
+      assert.equal((await stat(join(pipeline, stage))).isDirectory(), true);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('adds a collision suffix without overwriting a run', async () => {
+test('increments the run number without overwriting an earlier pipeline', async () => {
   const root = await mkdtemp(join(process.cwd(), 'test', 'output-layout-'));
   try {
-    const date = new Date(2026, 10, 14, 9, 8, 7);
-    const first = await createOutputRun(root, date);
-    const second = await createOutputRun(root, date);
-    assert.equal(first, join(root, '2026-11-14', '09-08-07'));
-    assert.equal(second, join(root, '2026-11-14', '09-08-07-01'));
+    const first = await createPipelineRun(root);
+    const second = await createPipelineRun(root);
+    assert.equal(first, join(root, 'Running#1'));
+    assert.equal(second, join(root, 'Running#2'));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

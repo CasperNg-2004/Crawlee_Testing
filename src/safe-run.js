@@ -3,7 +3,9 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { positiveInteger } from './common-utils.js';
 import {
-  createOutputRun,
+  createPipelineRun,
+  ensurePipelineStage,
+  findLatestPipelineRun,
   findLatestOutputRun,
   outputFile,
 } from './output-paths.js';
@@ -33,10 +35,14 @@ const plannedDetailCount = directPlaceCount || maxPlaces;
 const discoveryRequestCount = directPlaceCount ? 0 : areas.length * queries.length;
 const plannedRequestCount = discoveryRequestCount + plannedDetailCount;
 const storageDir = resolve(process.env.CRAWLEE_STORAGE_DIR?.trim() || 'storage');
-const outputBaseDir = resolve(process.env.OUTPUT_DIR?.trim() || 'output/scraper');
-const outputRunDir = resume
-  ? await findLatestOutputRun(outputBaseDir, 'other/safe-run.json')
-  : await createOutputRun(outputBaseDir);
+const outputRoot = resolve(process.env.OUTPUT_ROOT?.trim() || 'output');
+const legacyOutputBaseDir = resolve(process.env.OUTPUT_DIR?.trim() || 'output/scraper');
+const pipelineRunDir = resume
+  ? await findLatestPipelineRun(outputRoot, 'scraper/other/safe-run.json')
+  : await createPipelineRun(outputRoot);
+const outputRunDir = pipelineRunDir
+  ? await ensurePipelineStage(pipelineRunDir, 'scraper')
+  : await findLatestOutputRun(legacyOutputBaseDir, 'other/safe-run.json');
 if (!outputRunDir) {
   throw new Error('No resumable scraper output run was found. Use `npm run start:safe` for a fresh run.');
 }
