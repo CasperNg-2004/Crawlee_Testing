@@ -6,6 +6,13 @@ export function cleanMenuDescription(description, priceText) {
   return cleanedDescription;
 }
 
+export function countMenuItems(menu) {
+  return menu?.sections?.reduce(
+    (total, section) => total + (Array.isArray(section?.items) ? section.items.length : 0),
+    0,
+  ) || 0;
+}
+
 function cleanText(value) {
   return value?.replace(/\s+/g, ' ').trim() || null;
 }

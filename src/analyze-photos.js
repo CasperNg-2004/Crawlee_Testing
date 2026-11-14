@@ -1,5 +1,6 @@
 // Independent photo analyzer for the Google Maps photo metadata already saved
-// in output/restaurants.json. This file does not launch or modify the scraper.
+// in the newest output/scraper/<date>/<time>/json/restaurants.json. This file
+// does not launch or modify the scraper.
 //
 // Run a two-place test (default):
 //   npm run analyze:photos
@@ -8,7 +9,7 @@
 // Recalculate accuracy after filling config/photo-analysis-labels.csv:
 //   npm run analyze:photos:evaluate
 
-import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { basename, join, resolve } from 'node:path';
@@ -17,6 +18,22 @@ import { createInterface } from 'node:readline';
 import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
 import { env, pipeline, RawImage } from '@huggingface/transformers';
+import {
+  conciseError,
+  csvCell,
+  fileExists,
+  numberOrNull,
+  parseCsv,
+  positiveInteger,
+  sleep,
+} from './common-utils.js';
+import {
+  createOutputRun,
+  findLatestOutputFile,
+  findLatestOutputRun,
+  listOutputRuns,
+  outputFile,
+} from './output-paths.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const PROMPTS = {
@@ -49,8 +66,16 @@ const PROMPT_TO_CATEGORY = new Map(
 const args = new Set(process.argv.slice(2));
 const resume = args.has('--resume');
 const evaluateOnly = args.has('--evaluate-only');
-const inputPath = resolve(process.env.PHOTO_ANALYSIS_INPUT?.trim() || 'output/restaurants.json');
-const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-analysis');
+const explicitInputPath = process.env.PHOTO_ANALYSIS_INPUT?.trim();
+const inputPath = explicitInputPath
+  ? resolve(explicitInputPath)
+  : await findLatestOutputFile('output/scraper', [
+    'json/restaurants.json',
+    'json/restaurants-classified.json',
+    'restaurants.json',
+  ]);
+if (!inputPath) throw new Error('No scraper restaurants.json output was found for photo classification.');
+const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification');
 const labelsPath = resolve(process.env.PHOTO_ANALYSIS_LABELS?.trim() || 'config/photo-analysis-labels.csv');
 const modelCacheDir = resolve(process.env.PHOTO_ANALYSIS_MODEL_CACHE?.trim() || '.cache/transformers');
 const ocrCacheDir = resolve(process.env.PHOTO_ANALYSIS_OCR_CACHE?.trim() || '.cache/tesseract');
@@ -112,10 +137,9 @@ async function runAnalysis() {
   if (!selectedPlaces.length) throw new Error(`No places with photos were found in ${inputPath}.`);
 
   const resumedRun = resume ? await findLatestIncompleteRun() : null;
-  const runRoot = resumedRun || join(outputRoot, timestampForPath(new Date()));
-  await mkdir(runRoot, { recursive: true });
-  const partialPath = join(runRoot, 'photo-analysis.partial.json');
-  const finalPath = join(runRoot, 'photo-analysis.json');
+  const runRoot = resumedRun || await createOutputRun(outputRoot);
+  const partialPath = outputFile(runRoot, 'json', 'photo-analysis.partial.json');
+  const finalPath = outputFile(runRoot, 'json', 'photo-analysis.json');
   const startedAt = new Date();
   const report = resumedRun
     ? JSON.parse(await readFile(partialPath, 'utf8'))
@@ -174,7 +198,7 @@ async function runAnalysis() {
           if (!ocrRunner) {
             console.log(`  Starting the reusable ${ocrEngine} OCR worker.`);
             ocrRunner = ocrEngine === 'paddleocr'
-              ? await createPaddleOcrRunner(join(runRoot, '.paddleocr-temp'))
+              ? await createPaddleOcrRunner(join(runRoot, 'other', '.paddleocr-temp'))
               : await createTesseractOcrRunner();
           }
           return ocrRunner;
@@ -209,13 +233,13 @@ async function runAnalysis() {
   report.evaluation = evaluatePredictions(report.restaurants, labels);
   await writeJson(finalPath, report);
   await writeJson(partialPath, report);
-  await writeJson(join(runRoot, 'evaluation.json'), report.evaluation);
-  await writeLabelsTemplate(join(runRoot, 'photo-labels-template.csv'), report.restaurants, labels);
+  await writeJson(outputFile(runRoot, 'json', 'evaluation.json'), report.evaluation);
+  await writeLabelsTemplate(outputFile(runRoot, 'csv', 'photo-labels-template.csv'), report.restaurants, labels);
 
   console.log(`\nComplete: ${report.counts.imagesAnalyzed} analyzed, ${report.counts.imagesFailed} failed.`);
   console.log(`Category counts: ${JSON.stringify(report.counts.categories)}.`);
   console.log(`Results: ${finalPath}`);
-  console.log(`Validation template: ${join(runRoot, 'photo-labels-template.csv')}`);
+  console.log(`Validation template: ${outputFile(runRoot, 'csv', 'photo-labels-template.csv')}`);
   if (report.evaluation.status !== 'evaluated') {
     console.log(`Precision is not available yet: ${report.evaluation.note}`);
   }
@@ -660,13 +684,13 @@ function evaluatePredictions(restaurants, labels) {
 async function runEvaluationOnly() {
   const runRoot = await findLatestRun('photo-analysis.json');
   if (!runRoot) throw new Error(`No completed photo-analysis.json was found under ${outputRoot}.`);
-  const finalPath = join(runRoot, 'photo-analysis.json');
+  const finalPath = await existingRunFile(runRoot, 'photo-analysis.json');
   const report = JSON.parse(await readFile(finalPath, 'utf8'));
   const labels = await loadGroundTruth(labelsPath);
   report.evaluation = evaluatePredictions(report.restaurants || [], labels);
   report.updatedAt = new Date().toISOString();
   await writeJson(finalPath, report);
-  await writeJson(join(runRoot, 'evaluation.json'), report.evaluation);
+  await writeJson(outputFile(runRoot, 'json', 'evaluation.json'), report.evaluation);
   // Evaluation reads the completed labels file and does not need to regenerate
   // the template. Skipping that derived file also avoids Windows/Excel locks
   // preventing otherwise valid evaluation results from being saved.
@@ -767,68 +791,24 @@ async function writeFileWithRetry(path, contents, attempts = 10) {
   throw new Error(`Could not write ${basename(path)} after ${attempts} attempts: ${conciseError(lastError)}`);
 }
 
-function parseCsv(text) {
-  const rows = [];
-  let row = [];
-  let cell = '';
-  let quoted = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (quoted) {
-      if (character === '"' && text[index + 1] === '"') {
-        cell += '"';
-        index += 1;
-      } else if (character === '"') {
-        quoted = false;
-      } else {
-        cell += character;
-      }
-    } else if (character === '"') {
-      quoted = true;
-    } else if (character === ',') {
-      row.push(cell);
-      cell = '';
-    } else if (character === '\n') {
-      row.push(cell.replace(/\r$/, ''));
-      if (row.some((value) => value.length)) rows.push(row);
-      row = [];
-      cell = '';
-    } else {
-      cell += character;
-    }
-  }
-  if (cell.length || row.length) {
-    row.push(cell);
-    rows.push(row);
-  }
-  if (!rows.length) return [];
-  const headers = rows[0].map((header) => header.trim());
-  return rows.slice(1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
+async function findLatestRun(filename) {
+  return findLatestOutputRun(outputRoot, [`json/${filename}`, filename]);
 }
 
-async function findLatestRun(filename) {
-  const entries = await readdir(outputRoot, { withFileTypes: true }).catch(() => []);
-  const candidates = entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => join(outputRoot, entry.name))
-    .sort((left, right) => basename(right).localeCompare(basename(left)));
-  for (const candidate of candidates) {
-    if (await fileExists(join(candidate, filename))) return candidate;
+async function findLatestIncompleteRun() {
+  for (const candidate of await listOutputRuns(outputRoot)) {
+    const partialPath = await existingRunFile(candidate, 'photo-analysis.partial.json');
+    const finalPath = await existingRunFile(candidate, 'photo-analysis.json');
+    if (!partialPath || finalPath) continue;
+    const partial = JSON.parse(await readFile(partialPath, 'utf8'));
+    if (partial.status !== 'complete') return candidate;
   }
   return null;
 }
 
-async function findLatestIncompleteRun() {
-  const entries = await readdir(outputRoot, { withFileTypes: true }).catch(() => []);
-  const candidates = entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => join(outputRoot, entry.name))
-    .sort((left, right) => basename(right).localeCompare(basename(left)));
-  for (const candidate of candidates) {
-    const partialPath = join(candidate, 'photo-analysis.partial.json');
-    if (!await fileExists(partialPath) || await fileExists(join(candidate, 'photo-analysis.json'))) continue;
-    const partial = JSON.parse(await readFile(partialPath, 'utf8'));
-    if (partial.status !== 'complete') return candidate;
+async function existingRunFile(runRoot, filename) {
+  for (const candidate of [outputFile(runRoot, 'json', filename), join(runRoot, filename)]) {
+    if (await fileExists(candidate)) return candidate;
   }
   return null;
 }
@@ -944,19 +924,9 @@ function safeDivide(numerator, denominator) {
   return denominator ? round(numerator / denominator, 6) : null;
 }
 
-function numberOrNull(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
 function round(value, decimals) {
   const multiplier = 10 ** decimals;
   return Math.round(value * multiplier) / multiplier;
-}
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function optionalPositiveInteger(value) {
@@ -980,28 +950,6 @@ function formatPercent(value) {
   return Number.isFinite(value) ? `${Math.round(value * 100)}%` : 'n/a';
 }
 
-function timestampForPath(date) {
-  return date.toISOString().replace(/[:.]/g, '-');
-}
-
-function csvCell(value) {
-  const text = value == null ? '' : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
-
-function conciseError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\s+/g, ' ').trim().slice(0, 500);
-}
-
-async function fileExists(path) {
-  return access(path).then(() => true).catch(() => false);
-}
-
 async function writeJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }

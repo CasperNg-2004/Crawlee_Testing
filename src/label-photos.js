@@ -2,15 +2,31 @@
 // It reads the latest independent photo-analysis output and writes labels to
 // config/photo-analysis-labels.csv, which analyze-photos.js already uses.
 
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { basename, dirname, extname, join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { basename, dirname, extname, resolve } from 'node:path';
+import {
+  booleanValue,
+  conciseError,
+  csvCell,
+  fileExists,
+  numberOrNull,
+  parseCsv,
+  positiveInteger,
+} from './common-utils.js';
+import {
+  openBrowser,
+  readJsonBody,
+  send,
+  sendJson,
+  writeFileWithRetry,
+} from './local-tool-utils.js';
+import { findLatestOutputFile } from './output-paths.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const host = '127.0.0.1';
 const port = positiveInteger(process.env.PHOTO_LABEL_PORT, 3789);
-const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-analysis');
+const outputRoot = resolve(process.env.PHOTO_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-classification');
 const explicitInput = process.env.PHOTO_LABEL_INPUT?.trim();
 const labelsPath = resolve(process.env.PHOTO_ANALYSIS_LABELS?.trim() || 'config/photo-analysis-labels.csv');
 const shouldOpenBrowser = booleanValue(process.env.PHOTO_LABEL_OPEN_BROWSER, true);
@@ -171,27 +187,13 @@ async function queueSave() {
 }
 
 async function writeLabelsWithRetry(csv) {
-  const temporaryPath = `${labelsPath}.${process.pid}.tmp`;
-  let lastError = null;
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    try {
-      await writeFile(temporaryPath, csv, 'utf8');
-      await rename(temporaryPath, labelsPath);
-      return;
-    } catch (error) {
-      lastError = error;
-      await rm(temporaryPath, { force: true }).catch(() => {});
-      if (!isRetryableFileError(error) || attempt === 10) break;
-      await sleep(Math.min(150 * attempt, 1_000));
-    }
+  try {
+    await writeFileWithRetry(labelsPath, csv);
+  } catch (error) {
+    throw new Error(
+      `Could not save labels after 10 attempts. Close ${basename(labelsPath)} if it is open in Excel, then choose the category again. ${conciseError(error)}`,
+    );
   }
-  throw new Error(
-    `Could not save labels after 10 attempts. Close ${basename(labelsPath)} if it is open in Excel, then choose the category again. ${conciseError(lastError)}`,
-  );
-}
-
-function isRetryableFileError(error) {
-  return ['UNKNOWN', 'EBUSY', 'EPERM', 'EACCES', 'EEXIST'].includes(error?.code);
 }
 
 function buildLabelsCsv(allRecords, labelMap) {
@@ -226,136 +228,12 @@ async function loadLabels(path) {
   return parseCsv(text);
 }
 
-function parseCsv(text) {
-  const rows = [];
-  let row = [];
-  let cell = '';
-  let quoted = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (quoted) {
-      if (character === '"' && text[index + 1] === '"') {
-        cell += '"';
-        index += 1;
-      } else if (character === '"') {
-        quoted = false;
-      } else {
-        cell += character;
-      }
-    } else if (character === '"') {
-      quoted = true;
-    } else if (character === ',') {
-      row.push(cell);
-      cell = '';
-    } else if (character === '\n') {
-      row.push(cell.replace(/\r$/, ''));
-      if (row.some((value) => value.length)) rows.push(row);
-      row = [];
-      cell = '';
-    } else {
-      cell += character;
-    }
-  }
-  if (cell.length || row.length) {
-    row.push(cell);
-    rows.push(row);
-  }
-  if (!rows.length) return [];
-  const headers = rows[0].map((header) => header.trim());
-  return rows.slice(1).map((values) => Object.fromEntries(
-    headers.map((header, index) => [header, values[index] || '']),
-  ));
-}
-
 async function findLatestCompletedAnalysis(root) {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const directories = entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => join(root, entry.name))
-    .sort((left, right) => basename(right).localeCompare(basename(left)));
-  for (const directory of directories) {
-    const candidate = join(directory, 'photo-analysis.json');
-    if (await fileExists(candidate)) return candidate;
-  }
-  return null;
-}
-
-async function readJsonBody(request) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > 1_000_000) throw new Error('Request body is too large.');
-    chunks.push(chunk);
-  }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-}
-
-function sendJson(response, status, value) {
-  return send(response, status, `${JSON.stringify(value)}\n`, 'application/json; charset=utf-8');
-}
-
-function send(response, status, body, contentType) {
-  response.writeHead(status, {
-    'Content-Type': contentType,
-    'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
-  });
-  response.end(body);
-}
-
-function openBrowser(url) {
-  try {
-    const command = process.platform === 'win32'
-      ? spawn(process.env.ComSpec || 'cmd.exe', ['/c', 'start', '', url], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      })
-      : process.platform === 'darwin'
-        ? spawn('open', [url], { detached: true, stdio: 'ignore' })
-        : spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
-    command.unref();
-  } catch (error) {
-    console.warn(`Could not open the browser automatically: ${conciseError(error)}`);
-  }
-}
-
-function csvCell(value) {
-  const text = value == null ? '' : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  return findLatestOutputFile(root, ['json/photo-analysis.json', 'photo-analysis.json']);
 }
 
 function cleanText(value) {
   return String(value || '').replace(/\r/g, '').trim();
-}
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function booleanValue(value, fallback) {
-  if (value == null || !String(value).trim()) return fallback;
-  return /^(1|true|yes|on)$/i.test(String(value).trim());
-}
-
-function numberOrNull(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function conciseError(error) {
-  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, 500);
-}
-
-async function fileExists(path) {
-  return access(path).then(() => true).catch(() => false);
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
 const HTML = String.raw`<!doctype html>

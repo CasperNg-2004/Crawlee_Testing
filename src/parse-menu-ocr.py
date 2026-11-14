@@ -21,6 +21,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+SRC_DIRECTORY = Path(__file__).resolve().parent
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+from output_paths import stage_output_directory, typed_output
+
 
 PRICE_VALUE_PATTERN = re.compile(r"(?<!\d)\+?(\d{1,4}(?:[.,]\d{1,2})?)(?!\d)")
 EXPLICIT_PRICE_PATTERN = re.compile(
@@ -58,8 +63,12 @@ def main() -> int:
     typed_catalog = load_typed_catalog(args.typed_menu)
     ground_truth = load_ground_truth(args.ground_truth)
     unpaired_labels = load_unpaired_labels(args.unpaired_labels)
-    output_dir = Path(args.output_dir or default_output_dir()).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = stage_output_directory(
+        Path("output") / "photo-analysis",
+        "menu-parsing",
+        explicit=args.output_dir,
+        source=input_path,
+    )
 
     started = time.perf_counter()
     parsed_images = []
@@ -111,19 +120,19 @@ def main() -> int:
     ambiguous = flatten_ambiguous(parsed_images)
     unpaired = flatten_unpaired(parsed_images)
     template = ground_truth_template(parsed_images)
-    write_json(output_dir / "structured-menu.json", report)
-    write_structured_csv(output_dir / "structured-menu.csv", parsed_images)
-    write_json(output_dir / "ambiguous-items.json", ambiguous)
-    write_json(output_dir / "unpaired-lines.json", unpaired)
-    write_json(output_dir / "evaluation.json", evaluation)
-    write_json(output_dir / "ground-truth-template.json", template)
+    write_json(typed_output(output_dir, "json", "structured-menu.json"), report)
+    write_structured_csv(typed_output(output_dir, "csv", "structured-menu.csv"), parsed_images)
+    write_json(typed_output(output_dir, "json", "ambiguous-items.json"), ambiguous)
+    write_json(typed_output(output_dir, "json", "unpaired-lines.json"), unpaired)
+    write_json(typed_output(output_dir, "json", "evaluation.json"), evaluation)
+    write_json(typed_output(output_dir, "json", "ground-truth-template.json"), template)
 
     summary = {
         "status": report["status"],
         **report["counts"],
         "evaluationStatus": evaluation["status"],
         "elapsedSeconds": report["elapsedSeconds"],
-        "output": str(output_dir / "structured-menu.json"),
+        "output": str(typed_output(output_dir, "json", "structured-menu.json")),
     }
     print("MENU_OCR_PARSE_SUMMARY " + json.dumps(summary, ensure_ascii=False))
     return 0
@@ -1431,11 +1440,6 @@ def write_structured_csv(path: Path, images: list[dict[str, Any]]) -> None:
                         }
                     )
     temporary.replace(path)
-
-
-def default_output_dir() -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
-    return str(Path("output") / "menu-ocr-parsing" / timestamp)
 
 
 def iso_now() -> str:

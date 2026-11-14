@@ -1,11 +1,14 @@
 import { mkdir, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import ExcelJS from 'exceljs';
-
-const FONT_NAME = 'Arial';
-const HEADER_COLOR = 'FF1F4E78';
-const HEADER_FONT_COLOR = 'FFFFFFFF';
-const LINK_COLOR = 'FF0563C1';
+import {
+  column,
+  createSheet,
+  hyperlink,
+  styleLinkCell,
+  styleStatusCell as styleSharedStatusCell,
+} from './excel-utils.js';
+import { countMenuItems } from './menu-utils.js';
 const STATUS_COLORS = {
   success: { fill: 'FFE2F0D9', font: 'FF375623' },
   none: { fill: 'FFFFF2CC', font: 'FF7F6000' },
@@ -181,16 +184,16 @@ export async function exportRestaurantsToExcel(records, filePath) {
 }
 
 function writePlacesSheet(workbook, rows) {
-  const sheet = createSheet(workbook, 'Places', placeColumns(), 'FF1F4E78');
+  const sheet = createSheet(workbook, 'Places', placeColumns(), 'FF1F4E78', { commitHeader: true });
   for (const value of rows) {
     const row = sheet.addRow({
       ...value,
       website: hyperlink(value.website),
       googleMapsUrl: hyperlink(value.googleMapsUrl),
     });
-    styleStatusCell(row.getCell('menuStatus'), value.menuStatus);
-    styleStatusCell(row.getCell('photoStatus'), value.photoStatus);
-    styleStatusCell(row.getCell('reviewStatus'), value.reviewStatus);
+    styleSharedStatusCell(row.getCell('menuStatus'), value.menuStatus, STATUS_COLORS);
+    styleSharedStatusCell(row.getCell('photoStatus'), value.photoStatus, STATUS_COLORS);
+    styleSharedStatusCell(row.getCell('reviewStatus'), value.reviewStatus, STATUS_COLORS);
     styleLinkCell(row.getCell('website'));
     styleLinkCell(row.getCell('googleMapsUrl'));
     row.commit();
@@ -199,7 +202,7 @@ function writePlacesSheet(workbook, rows) {
 }
 
 function writeSimpleSheet(workbook, name, columns, rows, options = {}) {
-  const sheet = createSheet(workbook, name, columns, options.tabColor);
+  const sheet = createSheet(workbook, name, columns, options.tabColor, { commitHeader: true });
   for (const value of rows) {
     const rowValue = { ...value };
     if (name === 'Photos') rowValue.fullSizeImageUrl = hyperlink(value.fullSizeImageUrl);
@@ -208,30 +211,6 @@ function writeSimpleSheet(workbook, name, columns, rows, options = {}) {
     row.commit();
   }
   sheet.commit();
-}
-
-function createSheet(workbook, name, columns, tabColor) {
-  const sheet = workbook.addWorksheet(name, {
-    properties: { defaultRowHeight: 18, tabColor: { argb: tabColor } },
-    views: [{ state: 'frozen', ySplit: 1, xSplit: 2, showGridLines: false }],
-  });
-  sheet.columns = columns.map((column) => ({
-    ...column,
-    style: {
-      font: { name: FONT_NAME, size: 10, color: { argb: 'FF222222' } },
-      alignment: { vertical: 'middle', wrapText: Boolean(column.wrapText) },
-      numFmt: column.numFmt,
-    },
-  }));
-  const header = sheet.getRow(1);
-  header.height = 28;
-  header.font = { name: FONT_NAME, size: 10, bold: true, color: { argb: HEADER_FONT_COLOR } };
-  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_COLOR } };
-  header.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-  header.border = { bottom: { style: 'thin', color: { argb: 'FFFFFFFF' } } };
-  header.commit();
-  sheet.autoFilter = { from: 'A1', to: `${columnLetter(columns.length)}1` };
-  return sheet;
 }
 
 function placeColumns() {
@@ -308,50 +287,14 @@ function aboutColumns() {
   ];
 }
 
-function column(header, key, width, wrapText = false, numFmt = undefined) {
-  return { header, key, width, wrapText, numFmt };
-}
-
-function styleStatusCell(cell, status) {
-  const colors = STATUS_COLORS[status];
-  if (!colors) return;
-  cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colors.fill } };
-  cell.font = { name: FONT_NAME, size: 10, bold: true, color: { argb: colors.font } };
-  cell.alignment = { horizontal: 'center', vertical: 'middle' };
-}
-
-function styleLinkCell(cell) {
-  if (!cell.value) return;
-  cell.font = { name: FONT_NAME, size: 10, color: { argb: LINK_COLOR }, underline: true };
-}
-
-function hyperlink(url) {
-  return url ? { text: url, hyperlink: url } : null;
-}
-
 function dateOrNull(value) {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function countMenuItems(menu) {
-  return menu?.sections?.reduce((total, section) => total + (section.items?.length || 0), 0) || 0;
-}
-
 function yesNo(value) {
   if (value === true) return 'Yes';
   if (value === false) return 'No';
   return null;
-}
-
-function columnLetter(count) {
-  let value = count;
-  let result = '';
-  while (value > 0) {
-    value -= 1;
-    result = String.fromCharCode(65 + (value % 26)) + result;
-    value = Math.floor(value / 26);
-  }
-  return result;
 }

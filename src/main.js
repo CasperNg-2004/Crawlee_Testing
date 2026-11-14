@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   PlaywrightCrawler,
   Dataset,
@@ -10,6 +10,7 @@ import {
   log,
 } from 'crawlee';
 import { classifyMalaysiaBrand, loadMalaysiaBrandCatalog } from './brand-classifier.js';
+import { positiveInteger } from './common-utils.js';
 import {
   extractGooglePlaceMetadata,
   extractGooglePlaceMetadataFromText,
@@ -17,7 +18,8 @@ import {
   normalizeGooglePlaceInput,
   selectBestGooglePlaceUrl,
 } from './google-place.js';
-import { cleanMenuDescription } from './menu-utils.js';
+import { acceptGoogleConsentIfShown } from './google-ui-utils.js';
+import { cleanMenuDescription, countMenuItems } from './menu-utils.js';
 import {
   normalizePhotoTabName,
   parseGoogleUploadDate,
@@ -27,6 +29,7 @@ import { flattenPhotoList, photoListToCsv } from './photo-export.js';
 import { exportRestaurantsToExcel } from './excel-export.js';
 import { extractGoogleReviews, normalizeReviewSort } from './review-scraper.js';
 import { classifyGoogleSafetyState, isSuspiciousEmptyMenu } from './safety.js';
+import { createOutputRun, ensureOutputTypes, outputFile } from './output-paths.js';
 
 let runSummaryPrinted = false;
 process.on('uncaughtException', (error) => {
@@ -40,7 +43,7 @@ process.on('uncaughtException', (error) => {
       failed: null,
       safetyStop: null,
       error: error?.message || String(error),
-      outputDir: process.env.OUTPUT_DIR?.trim() || 'output',
+      outputDir: process.env.OUTPUT_RUN_DIR?.trim() || process.env.OUTPUT_DIR?.trim() || 'output/scraper',
     })}`);
   }
   process.exit(1);
@@ -69,7 +72,12 @@ const maxPlaces = onePlaceMode ? 1 : positiveInteger(process.env.MAX_PLACES, 100
 const maxStalledScrolls = positiveInteger(process.env.MAX_STALLED_SCROLLS, 12);
 const scrollWaitMs = positiveInteger(process.env.SCROLL_WAIT_MS, 2_000);
 const headless = process.env.HEADLESS?.toLowerCase() !== 'false';
-const outputDir = process.env.OUTPUT_DIR?.trim() || 'output';
+const outputBaseDir = resolve(process.env.OUTPUT_DIR?.trim() || 'output/scraper');
+const outputDir = process.env.OUTPUT_RUN_DIR?.trim()
+  ? await ensureOutputTypes(resolve(process.env.OUTPUT_RUN_DIR.trim()))
+  : await createOutputRun(outputBaseDir);
+const jsonOutputDir = join(outputDir, 'json');
+const csvOutputDir = join(outputDir, 'csv');
 const chromeProfileDir = resolve(process.env.CHROME_PROFILE_DIR?.trim() || '.chrome-profile');
 const brandCatalogPath = resolve(
   process.env.CHAIN_CLASSIFICATION_CATALOG?.trim() || 'config/malaysia-chain-counts.json',
@@ -85,7 +93,7 @@ const searchTargets = queries.flatMap((searchQuery) => areas.map((searchArea) =>
   area: searchArea,
 })));
 const maxCandidatesPerArea = positiveInteger(process.env.MAX_CANDIDATES_PER_AREA, 150);
-const scrapePhotos = booleanValue(process.env.SCRAPE_PHOTOS, false);
+const scrapePhotos = strictBooleanValue(process.env.SCRAPE_PHOTOS, false);
 const photoTabs = (process.env.PHOTO_TABS?.trim() || 'Menu|By owner|All|Food & drink|Vibe')
   .split('|')
   .map((value) => value.trim())
@@ -100,13 +108,13 @@ const photoTabLimits = new Map([
   ['vibe', positiveInteger(process.env.PHOTO_LIMIT_VIBE, 3)],
 ]);
 const photoScrollRounds = positiveInteger(process.env.PHOTO_SCROLL_ROUNDS, 120);
-const photoCaptureUploadDate = booleanValue(process.env.PHOTO_CAPTURE_UPLOAD_DATE, true);
+const photoCaptureUploadDate = strictBooleanValue(process.env.PHOTO_CAPTURE_UPLOAD_DATE, true);
 const photoDateBatchSize = positiveInteger(process.env.PHOTO_DATE_BATCH_SIZE, 10);
 const photoDateConcurrency = positiveInteger(process.env.PHOTO_DATE_CONCURRENCY, 1);
 const photoDateWaitMs = positiveInteger(process.env.PHOTO_DATE_WAIT_MS, 300);
 const photoProbeConcurrency = positiveInteger(process.env.PHOTO_PROBE_CONCURRENCY, 2);
-const photoDebug = booleanValue(process.env.PHOTO_DEBUG, false);
-const scrapeReviews = booleanValue(process.env.SCRAPE_REVIEWS, true);
+const photoDebug = strictBooleanValue(process.env.PHOTO_DEBUG, false);
+const scrapeReviews = strictBooleanValue(process.env.SCRAPE_REVIEWS, true);
 const reviewMaxPerPlace = positiveInteger(process.env.REVIEW_MAX_PER_PLACE, 50);
 const reviewScrollRounds = positiveInteger(process.env.REVIEW_SCROLL_ROUNDS, 100);
 const reviewScrollWaitMs = positiveInteger(process.env.REVIEW_SCROLL_WAIT_MS, 250);
@@ -117,7 +125,7 @@ const menuScrollWaitMs = positiveInteger(process.env.MENU_SCROLL_WAIT_MS, 350);
 const maxConsecutiveEmptyMenus = positiveInteger(
   process.env.MAX_CONSECUTIVE_EMPTY_MENUS, 3,
 );
-const requireGoogleSignIn = booleanValue(process.env.REQUIRE_GOOGLE_SIGN_IN, true);
+const requireGoogleSignIn = strictBooleanValue(process.env.REQUIRE_GOOGLE_SIGN_IN, true);
 const emptyMenuSafetyStateKey = 'EMPTY_MENU_SAFETY_STATE_V1';
 const isResumedStorageRun = process.env.CRAWLEE_PURGE_ON_START === '0';
 const configuredPlaceIds = (process.env.PLACE_IDS?.trim() || '')
@@ -155,7 +163,7 @@ const knownQueueRequestIds = new Set();
 const router = createPlaywrightRouter();
 
 router.addHandler('SEARCH', async ({ page, request, log: requestLog }) => {
-  await acceptConsentIfShown(page);
+  await acceptGoogleConsentIfShown(page);
   await enforceGoogleSafety(page, request);
 
   const feed = page.locator('div[role="feed"]');
@@ -215,7 +223,7 @@ router.addHandler('SEARCH', async ({ page, request, log: requestLog }) => {
 });
 
 router.addHandler('DETAIL', async ({ page, request, pushData, log: requestLog }) => {
-  await acceptConsentIfShown(page);
+  await acceptGoogleConsentIfShown(page);
   await enforceGoogleSafety(page, request);
   try {
     await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
@@ -594,40 +602,38 @@ if (!fatalSafetyStop) {
 const remainingSafetyFailures = appendRemainingSafetyFailures();
 
 const dataset = await Dataset.getData({ limit: maxPlaces });
-await mkdir(outputDir, { recursive: true });
 let exportedRecords = dataset.items;
 if (onePlaceMode) {
   const onePlaceRecord = dataset.items[0] ?? failedRestaurantRecords[0] ?? null;
   exportedRecords = onePlaceRecord ? [onePlaceRecord] : [];
-  await writeFileAtomic(`${outputDir}/place.json`, `${JSON.stringify(onePlaceRecord, null, 2)}\n`);
+  await writeFileAtomic(outputFile(outputDir, 'json', 'place.json'), `${JSON.stringify(onePlaceRecord, null, 2)}\n`);
 } else {
-  await writeFileAtomic(`${outputDir}/restaurants.json`, `${JSON.stringify(dataset.items, null, 2)}\n`);
-  await writeFileAtomic(`${outputDir}/restaurants.csv`, toCsv(dataset.items));
+  await writeFileAtomic(outputFile(outputDir, 'json', 'restaurants.json'), `${JSON.stringify(dataset.items, null, 2)}\n`);
+  await writeFileAtomic(outputFile(outputDir, 'csv', 'restaurants.csv'), toCsv(dataset.items));
 }
 const photoList = flattenPhotoList(exportedRecords);
-await writeFileAtomic(`${outputDir}/photo-list.json`, `${JSON.stringify(photoList, null, 2)}\n`);
-await writeFileAtomic(`${outputDir}/photo-list.csv`, photoListToCsv(photoList));
+await writeFileAtomic(outputFile(outputDir, 'json', 'photo-list.json'), `${JSON.stringify(photoList, null, 2)}\n`);
+await writeFileAtomic(outputFile(outputDir, 'csv', 'photo-list.csv'), photoListToCsv(photoList));
 const excelOutputPath = onePlaceMode
-  ? `${outputDir}/place.xlsx`
-  : `${outputDir}/restaurants.xlsx`;
+  ? outputFile(outputDir, 'xlsx', 'place.xlsx')
+  : outputFile(outputDir, 'xlsx', 'restaurants.xlsx');
 await exportRestaurantsToExcel(exportedRecords, excelOutputPath);
 await writeFileAtomic(
-  `${outputDir}/failed-restaurants.json`,
+  outputFile(outputDir, 'json', 'failed-restaurants.json'),
   `${JSON.stringify(failedRestaurantRecords, null, 2)}\n`,
 );
 log.info(
   `Finished in ${formatDuration(Date.now() - runStartedAt)}. `
   + `Scraped ${successfulPlaceCount}/${queuedPlaceCount} places successfully; ${failedPlaceCount} failed. `
   + (onePlaceMode
-    ? `Exported the one-place result to ${outputDir}/place.json.`
-    : `Exported ${dataset.items.length} records to ${outputDir}/restaurants.json and ${outputDir}/restaurants.csv.`)
-  + ` Exported ${photoList.length} photo-tab rows to ${outputDir}/photo-list.json and ${outputDir}/photo-list.csv.`
+    ? `Exported the one-place result to ${jsonOutputDir}/place.json.`
+    : `Exported ${dataset.items.length} records to ${jsonOutputDir}/restaurants.json and ${csvOutputDir}/restaurants.csv.`)
+  + ` Exported ${photoList.length} photo-tab rows to ${jsonOutputDir}/photo-list.json and ${csvOutputDir}/photo-list.csv.`
   + ` Exported the Excel workbook to ${excelOutputPath}.`,
 );
 const exitCode = fatalSafetyStop ? 2 : failedPlaceCount > 0 ? 1 : 0;
 const runStatus = fatalSafetyStop ? 'safety_stopped' : failedPlaceCount > 0 ? 'completed_with_failures' : 'success';
-runSummaryPrinted = true;
-console.log(`RUN_SUMMARY ${JSON.stringify({
+const runSummary = {
   status: runStatus,
   exitCode,
   succeeded: dataset.items.length,
@@ -635,7 +641,10 @@ console.log(`RUN_SUMMARY ${JSON.stringify({
   remainingMarkedFailed: remainingSafetyFailures,
   safetyStop: fatalSafetyStop,
   outputDir,
-})}`);
+};
+await writeFileAtomic(outputFile(outputDir, 'other', 'run-summary.json'), `${JSON.stringify(runSummary, null, 2)}\n`);
+runSummaryPrinted = true;
+console.log(`RUN_SUMMARY ${JSON.stringify(runSummary)}`);
 
 // Crawlee leaves its Chrome version-probe child alive with persistent contexts on Windows.
 // All crawler teardown and output writes are complete here, so exit cleanly and release the profile.
@@ -645,21 +654,6 @@ async function writeFileAtomic(filePath, contents) {
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, contents, 'utf8');
   await rename(temporaryPath, filePath);
-}
-
-async function acceptConsentIfShown(page) {
-  const candidates = [
-    page.getByRole('button', { name: /accept all/i }),
-    page.getByRole('button', { name: /agree/i }),
-  ];
-
-  for (const candidate of candidates) {
-    if (await candidate.first().isVisible().catch(() => false)) {
-      await candidate.first().click();
-      await page.waitForTimeout(750);
-      return;
-    }
-  }
 }
 
 async function detectGoogleSafetyIssue(page) {
@@ -792,7 +786,7 @@ async function restoreRunProgress() {
 
   try {
     const priorFailures = JSON.parse(
-      await readFile(`${outputDir}/failed-restaurants.json`, 'utf8'),
+      await readFile(outputFile(outputDir, 'json', 'failed-restaurants.json'), 'utf8'),
     );
     if (Array.isArray(priorFailures)) {
       for (const record of priorFailures) {
@@ -1536,10 +1530,6 @@ function normalizeCurrency(token) {
   return currencies[value] ?? token;
 }
 
-function countMenuItems(menu) {
-  return menu?.sections?.reduce((total, section) => total + section.items.length, 0) ?? 0;
-}
-
 async function extractAbout(page) {
   const aboutTab = page.getByRole('tab', { name: /^about\b/i }).first();
   if (await aboutTab.isVisible().catch(() => false)) {
@@ -1867,7 +1857,7 @@ async function collectGooglePhotoTab(page, canonicalUrl, tab, scanLimit) {
 
 async function collectGooglePhotoTabOnce(page, canonicalUrl, tab, scanLimit) {
   await page.goto(canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await acceptConsentIfShown(page);
+  await acceptGoogleConsentIfShown(page);
   await enforceGoogleSafety(page, { url: canonicalUrl, userData: {} });
   await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
   const heading = await page.locator('h1').first().innerText().catch(() => '');
@@ -2068,7 +2058,7 @@ async function collectGooglePhotoDates(
 
 async function openGooglePhotoDateViewer(page, canonicalUrl, tab, photo) {
   await page.goto(canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await acceptConsentIfShown(page);
+  await acceptGoogleConsentIfShown(page);
   await enforceGoogleSafety(page, { url: canonicalUrl, userData: {} });
   await page.locator('h1').first().waitFor({ state: 'visible', timeout: 20_000 });
   if (!await openGooglePhotoGallery(page)) {
@@ -2230,12 +2220,7 @@ async function probeFullSizePhotos(page, photos) {
   }, { entries: inputs, concurrency: photoProbeConcurrency });
 }
 
-function positiveInteger(value, fallback) {
-  const number = Number.parseInt(value ?? '', 10);
-  return Number.isInteger(number) && number > 0 ? number : fallback;
-}
-
-function booleanValue(value, fallback) {
+function strictBooleanValue(value, fallback) {
   if (value == null || value === '') return fallback;
   return value.toLowerCase() === 'true';
 }

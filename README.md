@@ -7,19 +7,18 @@ retained as a historical fallback. The scraper can run multiple search terms
 across multiple Kuala Lumpur areas, distribute the final place limit fairly,
 visit each selected place, and export JSON and CSV files.
 
-The current workflow has two primary stages plus an optional review diagnostic:
+The current workflow has three clearly separated sections:
 
 1. The main scraper discovers locations and collects place details, structured
    menus, Popular times, About attributes, photos, 50 newest reviews, and
    Malaysia brand-size fields.
-2. The photo analyzer classifies saved photo URLs, runs PaddleOCR on predicted
-   menu photos, supports manual browser labelling, and calculates evaluation
-   metrics. Tesseract remains available for historical-output reproduction.
-3. The optional independent review command can re-test review collection from
-   an existing main output without changing that output.
+2. Photo classification classifies saved photo URLs, supports manual browser
+   labelling, and calculates category evaluation metrics.
+3. Photo analysis runs PaddleOCR on menu photos, structures OCR menu evidence,
+   supports manual price review, and compares photo menus with typed menus.
 
-The optional independent review diagnostic and photo-analysis stage do not
-modify `output/restaurants.json`. They create timestamped output folders.
+The classification and analysis stages do not modify the selected scraper
+`restaurants.json`. Every command writes into a dated and timed run folder.
 
 ## End-to-end workflow
 
@@ -29,9 +28,6 @@ After installation and the one-time Google login, the normal sequence is:
 # Main location, menu, Popular-times, About, photo, and review scrape.
 npm run start:safe
 
-# Optional independent review diagnostic from the saved locations.
-npm run recon:reviews
-
 # One-time setup before the first PaddleOCR analysis.
 npm run setup:paddleocr
 
@@ -39,10 +35,19 @@ npm run setup:paddleocr
 npm run analyze:photos
 
 # Convert a PaddleOCR result into evidence-backed structured menu candidates.
-npm run parse:menu-ocr -- "output\paddleocr\my-test\paddleocr-analysis.json"
+npm run parse:menu-ocr -- "output\photo-analysis\<date>\<time>\paddleocr\json\paddleocr-analysis.json"
 
 # Manually categorize unresolved OCR price lines in a local browser.
 npm run label:menu-ocr
+
+# Build an exact file-to-place photo map for downloaded OCR images.
+npm run build:photo-map -- --selection "<selection.json>" --photo-list "output\scraper\<date>\<time>\json\photo-list.json" --output "<photo-map.csv>"
+
+# Match Google typed-menu offers against structured photo-menu offers.
+npm run match:menus -- --restaurants "output\scraper\<date>\<time>\json\restaurants.json" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"
+
+# Export the menu matching result to a client-readable Excel workbook.
+npm run export:report -- "<menu-matches.json>"
 
 # Manual image-category and optional OCR-text validation.
 npm run label:photos
@@ -54,9 +59,9 @@ npm run analyze:photos:evaluate
 npm run recon:paddleocr -- "C:\path\to\menu-photos"
 ```
 
-The photo analysis and optional review diagnostic can run in either order after
-the main scrape finishes. Do not run `npm run login`, a main scrape, and the
-review diagnostic simultaneously because they share `.chrome-profile`.
+Photo classification and analysis run after the main scrape. Do not run
+`npm run login` and a main scrape simultaneously because they share
+`.chrome-profile`.
 
 ## Current capabilities
 
@@ -173,12 +178,10 @@ model cache under the current Windows user profile.
 | --- | --- |
 | `npm run login` | Open normal Chrome with the dedicated scraper profile for manual sign-in. |
 | `npm start` | Run the main scraper in one Chrome process; best for short tests. |
-| `npm run scrape:one -- "<ChIJ ID or Maps URL>"` | Skip discovery and write one object to `output/place.json`. |
+| `npm run scrape:one -- "<ChIJ ID or Maps URL>"` | Skip discovery and write one object into a new dated scraper run. |
 | `npm run start:visible` | Run the main scraper with `HEADLESS=false` for this command. |
 | `npm run start:safe` | Start a fresh main scrape in restartable Chrome batches. |
 | `npm run resume:safe` | Continue the existing Crawlee queue without purging completed work. |
-| `npm run recon:reviews` | Collect reviews from locations in `output/restaurants.json`. |
-| `npm run classify:chains` | Apply the Malaysia brand catalog to an existing output. |
 | `npm run analyze:photos` | Start a new photo classification and OCR run. |
 | `npm run analyze:photos:resume` | Resume the newest incomplete photo-analysis checkpoint. |
 | `npm run label:photos` | Open the local browser photo-labelling interface. |
@@ -188,7 +191,12 @@ model cache under the current Windows user profile.
 | `npm run parse:menu-ocr -- "<paddleocr-analysis.json>"` | Independently pair OCR names, descriptions, and prices using layout geometry. |
 | `npm run label:menu-ocr` | Review and categorize unpaired OCR price lines in a local browser. |
 | `npm run test:menu-parser` | Run the synthetic safety tests for menu OCR pairing and evaluation. |
-| `npm run export:excel -- output\restaurants.json` | Rebuild the client-readable Excel workbook from an existing JSON output. |
+| `npm run build:photo-map -- --selection "<selection>" --photo-list "<photo-list>"` | Create an exact `fileName,placeId,photoId` CSV without name matching. |
+| `npm run match:menus -- --restaurants "<restaurants.json>" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"` | Compare typed Google menu offers with structured photo-menu offers. |
+| `npm run export:report -- "<menu-matches.json>"` | Create `menu-check.xlsx` in that matching run's `xlsx` folder. |
+| `npm run test:menu-matching` | Run the matcher and Excel-report synthetic tests. |
+| `npm run test:output-paths` | Verify dated run creation, type folders, collision handling, and Python stage reuse. |
+| `npm run export:excel` | Rebuild Excel from the newest scraper run; an exact JSON path can be supplied after `--`. |
 
 ## Google Maps login
 
@@ -299,33 +307,19 @@ REVIEW_SORT=newest
 | `SAFE_BATCH_SIZE` | Number of detail pages handled before safe mode restarts Chrome. |
 | `SAFE_RESTART_DELAY_MS` | Delay between safe-mode Chrome batches. |
 | `SAFE_MAX_CONSECUTIVE_FAILURES` | Number of consecutive failed batches allowed before safe mode stops. |
-| `OUTPUT_DIR` | Main JSON and CSV directory; defaults to `output`. |
+| `OUTPUT_DIR` | Main JSON, CSV, Excel, failure, and photo-list directory; defaults to `output/scraper`. |
 | `CRAWLEE_STORAGE_DIR` | Safe-run queue and dataset directory; defaults to `storage`. |
 | `MAX_REQUESTS_PER_CRAWL` | Internal per-process cap controlled by safe mode. Normally do not set it manually. |
 | `CHAIN_CLASSIFICATION_CATALOG` | Malaysia brand-count catalog; defaults to `config/malaysia-chain-counts.json`. |
 | `COLUMNS` | Kept at `200` so Windows does not truncate the process header Crawlee reads. |
 
-### Review scraper configuration
-
-These settings can be added to `.env` or set temporarily in PowerShell:
+### Photo-classification and analysis configuration
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
-| `RECON_REVIEWS_INPUT` | `output/restaurants.json` | Location input created by the main scraper. |
-| `RECON_REVIEWS_OUTPUT_DIR` | `output/recon-reviews` | Root directory for timestamped review runs. |
-| `RECON_REVIEW_PLACE_LIMIT` | `50` | Maximum input locations processed. |
-| `RECON_REVIEW_MAX_PER_PLACE` | `50` | Maximum reviews requested from each location. |
-| `RECON_REVIEW_SCROLL_ROUNDS` | `100` | Maximum review-panel scrolling rounds. |
-| `RECON_REVIEW_SCROLL_WAIT_MS` | `250` | Delay after each review scroll, in milliseconds. |
-| `RECON_REVIEW_SORT` | `newest` | `newest`, `relevant`, `highest`, or `lowest`. |
-| `RECON_REVIEW_PLACES` | empty | Optional `\|`-separated exact place names from the input JSON. |
-
-### Photo-analysis configuration
-
-| Setting | Default | Meaning |
-| --- | ---: | --- |
-| `PHOTO_ANALYSIS_INPUT` | `output/restaurants.json` | Main output containing the photo URLs. |
-| `PHOTO_ANALYSIS_OUTPUT_DIR` | `output/photo-analysis` | Root directory for timestamped analysis runs. |
+| `PHOTO_ANALYSIS_INPUT` | newest scraper run | Optional exact main JSON containing photo URLs. Leave empty for automatic newest-run selection. |
+| `PHOTO_ANALYSIS_OUTPUT_DIR` | `output/photo-classification` | Root directory for timestamped classification runs. |
+| `PHOTO_MENU_ANALYSIS_OUTPUT_DIR` | `output/photo-analysis` | Root for PaddleOCR, structured parsing, and menu-matching jobs. |
 | `PHOTO_ANALYSIS_PLACE_LIMIT` | all | Empty or `all` processes every matching location; a positive number limits a test. |
 | `PHOTO_ANALYSIS_PLACES` | empty | Optional `\|`-separated exact place names. |
 | `PHOTO_ANALYSIS_MAX_PHOTOS_PER_PLACE` | `30` | Maximum photos analyzed per location. |
@@ -406,7 +400,7 @@ Safe mode completes all query-and-area discovery first and stores every selected
 detail URL in Crawlee's persistent queue. It then processes the queue in small
 Chrome batches. A log such as `4/50` refers to the current Chrome process; it
 does not cap the final output at four. Use the safe-run `handled` and `pending`
-counts and the final length of `output/restaurants.json` to confirm completion.
+counts and the final length of that run's `json/restaurants.json` to confirm completion.
 
 `npm run start:safe` creates a fresh queue for the current configuration.
 `npm run resume:safe` continues the existing queue. Do not use resume for a new
@@ -478,17 +472,36 @@ npm run scrape:one -- "ChIJa1yDFxRJzDERfLtufF3j-VI"
 ```
 
 This mode sets the place limit to one, skips area discovery, and writes a single
-JSON object to `output/place.json`. Normal batch mode continues to write the
-restaurant JSON and CSV files.
+JSON object into the new run's `json/place.json`. Normal batch mode writes its
+restaurant files into the same dated run structure.
 
 ## Output
 
-Each normal run writes:
+The output root is grouped by pipeline so results are easy to locate:
 
-- `output/restaurants.json`
-- `output/restaurants.csv`
-- `output/restaurants.xlsx`
-- `output/failed-restaurants.json`
+| Folder | Contains |
+| --- | --- |
+| `output/scraper/<date>/<time>/` | Main place JSON/CSV/Excel, failures, flat photo list, and run information. |
+| `output/photo-classification/<date>/<time>/` | CLIP category results, checkpoints, category labels, and evaluation. |
+| `output/photo-analysis/<date>/<time>/` | One photo-menu job containing PaddleOCR, parsing, and matching stages. |
+
+For example, a normal scraper run writes:
+
+```text
+output/scraper/2026-11-14/14-30-25/
+  json/restaurants.json
+  json/photo-list.json
+  json/failed-restaurants.json
+  csv/restaurants.csv
+  csv/photo-list.csv
+  xlsx/restaurants.xlsx
+  other/run-summary.json
+  other/safe-run.json
+```
+
+The date and time use the computer's local timezone. If two runs start in the
+same second, a numeric suffix is added. Every safe-run Chrome batch reuses the
+same folder, and `npm run resume:safe` reopens that preserved run.
 
 Crawlee also keeps its local dataset under `storage/datasets/default/`. Nested fields such as `menu`, `openingHours`, `popularTimes`, `peakHours`, `about`, and `contact` are stored as JSON strings inside the CSV.
 
@@ -507,13 +520,13 @@ unique photos across all five tabs. A successful tab can contain fewer than its
 configured limit when Google exposes fewer photos. When upload-date collection
 is explicitly disabled, `uploadDate` is intentionally `null`.
 
-Every run also writes `photo-list.json` and `photo-list.csv` beside the main
-output. These are flat reader inputs with one row per photo and source tab:
+Every run also writes `json/photo-list.json` and `csv/photo-list.csv`. These are
+flat reader inputs with one row per photo and source tab:
 `placeId`, `shopName`, `photoId`, `tab`, `uploadDate`, and `fullSizeImageUrl`.
 A photo present in multiple tabs has one row for each tab. See
 `PHOTO_TOOLS_HANDOVER.md` for the short analysis and labelling handover.
-For an existing result, regenerate them with
-`npm run export:photos -- output\restaurants.json`.
+For the newest result, regenerate them with `npm run export:photos`. Supply an
+exact `json/restaurants.json` path after `--` to target an older run.
 
 Every completed run also writes `restaurants.xlsx` while retaining
 `restaurants.json` and `restaurants.csv`. The workbook separates client-readable
@@ -521,7 +534,7 @@ data into `Places`, `Menu`, `Photos`, `Reviews`, `Opening Hours`,
 `Popular Times`, and `About` worksheets. To rebuild it from an existing result:
 
 ```powershell
-npm run export:excel -- output\restaurants.json
+npm run export:excel
 ```
 
 To scrape only one photo tab for a supplied list of places, override
@@ -843,38 +856,6 @@ Main review statuses are deliberately limited to:
 `none` is never used for a page that failed to load. Reviewer names, profile
 details, profile URLs/photos, histories, and owner responses are not collected.
 
-### Optional independent review diagnostic
-
-`src/recon-reviews.js` reads places from the completed main JSON, opens each
-saved Google Maps URL with the dedicated Chrome profile, selects the configured
-sort, expands truncated text, and collects up to the configured limit. It stays
-separate from the main scraper so review failures cannot invalidate complete
-place, menu, Popular-times, About, and photo records. It reuses the same shared
-review collector as the main scraper so selector and validation fixes are not
-duplicated across two implementations.
-
-Run the default input and limits:
-
-```powershell
-npm run recon:reviews
-```
-
-Run a two-location test with up to 50 reviews each:
-
-```powershell
-$env:RECON_REVIEW_PLACE_LIMIT = '2'
-$env:RECON_REVIEW_MAX_PER_PLACE = '50'
-$env:RECON_REVIEW_SORT = 'newest'
-npm run recon:reviews
-```
-
-Select exact location names from `output/restaurants.json`:
-
-```powershell
-$env:RECON_REVIEW_PLACES = 'Yellow Fin Horse|Natalina Italian Kitchen'
-npm run recon:reviews
-```
-
 ### Review privacy and item format
 
 Reviewer names, profile URLs, profile photos, review histories, and owner
@@ -897,8 +878,8 @@ count.
 ### Review collection and validation
 
 The target for a place is
-`min(RECON_REVIEW_MAX_PER_PLACE, availableReviewCount)` when the main record has
-a valid review count. Each place is attempted twice. The requested sort must be
+`min(REVIEW_MAX_PER_PLACE, availableReviewCount)` when the main record has a
+valid review count. Each place is attempted twice. The requested sort must be
 confirmed when more than one review is expected. `newest` also receives a
 relative-date order check with a small allowance for ambiguous positions.
 
@@ -907,7 +888,7 @@ published text, and review text form the fallback identity. Visible truncated
 reviews are expanded before saving. If selected text remains expandable, the
 attempt fails instead of silently saving incomplete text.
 
-The independent diagnostic's per-place statuses mean:
+The integrated review stage's per-place statuses mean:
 
 - `success`: the target number of reviews was collected;
 - `partial`: at least one review was collected, but fewer than the target;
@@ -917,22 +898,6 @@ The independent diagnostic's per-place statuses mean:
 
 Diagnostics include `attempts`, `stalledScrolls`, `newestOrderViolations`,
 `unexpandedReviewCount`, `error`, `scrapedAt`, and `elapsedMs`.
-
-### Review output
-
-Every run creates a timestamped directory:
-
-```text
-output/recon-reviews/<timestamp>/
-  001-place-name.json
-  002-place-name.json
-  ...
-  reviews.json
-```
-
-The numbered files contain one place result each. `reviews.json` contains run
-timestamps, input path, requested limits, sort, explicit privacy flags, status
-counts, total reviews, and every place result.
 
 ## Malaysia chain-size classification
 
@@ -986,28 +951,10 @@ The repository's current catalog contains an empty `brands` array. Therefore
 counts are added. The number of places found in one scrape is never treated as
 the Malaysia outlet total.
 
-The normal `npm start` and `npm run start:safe` commands now classify records
-automatically. The separate command remains available only for updating older
-output files without scraping again:
-
-```powershell
-npm run classify:chains
-```
-
-It creates `output/restaurants-classified.json` and
-`output/restaurants-classified.csv`. Each record receives only the two
-classification fields shown below. If the national count cannot be matched,
-both values remain `null`; the script never treats the number seen in the
-current scrape as the Malaysia total.
-
-The standalone command accepts optional path overrides:
-
-| Setting | Default |
-| --- | --- |
-| `CHAIN_CLASSIFICATION_INPUT` | `output/restaurants.json` |
-| `CHAIN_CLASSIFICATION_CATALOG` | `config/malaysia-chain-counts.json` |
-| `CHAIN_CLASSIFICATION_OUTPUT` | `output/restaurants-classified.json` |
-| `CHAIN_CLASSIFICATION_CSV_OUTPUT` | The JSON output name with `.csv` |
+The normal `npm start` and `npm run start:safe` commands classify records
+automatically. If the national count cannot be matched, both classification
+values remain `null`; the scraper never treats the number seen in the current
+run as the Malaysia outlet total.
 
 ```json
 {
@@ -1018,9 +965,9 @@ The standalone command accepts optional path overrides:
 
 ## Independent photo analysis
 
-`src/analyze-photos.js` reads photo URLs from the existing
-`output/restaurants.json`. It does not launch Google Maps and does not modify
-the main scraper or `restaurants.json`. Run it after scraping has finished:
+`src/analyze-photos.js` reads photo URLs from the newest scraper run unless
+`PHOTO_ANALYSIS_INPUT` names an exact JSON. It does not launch Google Maps and
+does not modify the main scraper or `restaurants.json`. Run it after scraping has finished:
 
 ```powershell
 npm run analyze:photos
@@ -1034,13 +981,15 @@ uses quantized CLIP to classify successfully loaded images as
 English and Malay OCR worker. Original full-size URLs remain in the output,
 but resized copies are used during analysis to control memory use.
 
-Each run creates a timestamped directory under `output/photo-analysis/` with:
+Each run creates `output/photo-classification/<date>/<time>/` with:
 
-- `photo-analysis.json`: combined restaurant results, individual image scores,
+- `json/photo-analysis.json`: combined restaurant results, individual image scores,
   OCR text, and run settings
-- `evaluation.json`: precision, recall, F1, accuracy, and confusion matrix when
+- `json/evaluation.json`: precision, recall, F1, accuracy, and confusion matrix when
   manual labels are available
-- `photo-labels-template.csv`: a review sheet for adding correct categories
+- `csv/photo-labels-template.csv`: a review sheet for adding correct categories
+- `xlsx/`: generated quick-view workbooks when requested
+- `other/`: temporary OCR state and other non-tabular artifacts
 
 `unknown` means the image loaded and was analyzed but the result was unclear.
 `failed` means the image could not be downloaded, decoded, or processed. CLIP
@@ -1154,14 +1103,14 @@ After the one-time setup, run one image or every supported image in a folder:
 
 ```powershell
 npm run setup:paddleocr
-npm run recon:paddleocr -- "output\ocr-handover-2026-11-10\evaluation-20"
+npm run recon:paddleocr -- "C:\path\to\menu-photos"
 ```
 
 Useful optional arguments are:
 
 ```powershell
 npm run recon:paddleocr -- "C:\path\to\photos" `
-  --output-dir "output\paddleocr\my-test" `
+  --output-dir "output\photo-analysis\<date>\<time>\paddleocr" `
   --model-size small `
   --save-visualizations
 ```
@@ -1208,9 +1157,12 @@ Run the parser on a PaddleOCR output:
 
 ```powershell
 npm run parse:menu-ocr -- `
-  "output\paddleocr\menu-20-2026-11-10\paddleocr-analysis.json" `
-  --output-dir "output\menu-ocr-parsing\my-run"
+  "output\photo-analysis\<date>\<time>\paddleocr\json\paddleocr-analysis.json"
 ```
+
+When the input follows the standard layout, the parser automatically writes to
+the same job under `menu-parsing/json`, `menu-parsing/csv`, and the other type
+folders. `--output-dir` is only needed for a custom stage location.
 
 Optional typed-menu validation uses the format in
 `config/menu-ocr-typed-menu.example.json`:
@@ -1259,8 +1211,8 @@ Run the local review interface after parsing:
 npm run label:menu-ocr
 ```
 
-It selects the newest `structured-menu.json` under
-`output/menu-ocr-parsing`, opens `http://127.0.0.1:3792`, and shows the source
+It selects the newest `menu-parsing/json/structured-menu.json` under
+`output/photo-analysis`, opens `http://127.0.0.1:3792`, and shows the source
 photo with the unresolved OCR line highlighted. You can classify a line as an
 item price, price variant, add-on price, bundle price, not a price, duplicate,
 unreadable, or unknown. Any category that creates menu data requires a manually
@@ -1274,7 +1226,7 @@ evidence:
 ```powershell
 npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
   --unpaired-labels "config\menu-ocr-unpaired-labels.json" `
-  --output-dir "output\menu-ocr-parsing\reviewed-run"
+  --output-dir "output\photo-analysis\<date>\<time>\menu-parsing"
 ```
 
 Verified item, variant, add-on, and bundle labels are merged into the structured
@@ -1282,6 +1234,80 @@ output with `humanVerified: true` and confidence `1.0`. `not_a_price` and
 `duplicate` resolve the evidence without creating an item. `unreadable` and
 `unknown` remain unresolved. The original OCR line and the complete review label
 are retained for audit.
+
+### Menu matching and comparison report
+
+The matcher is an independent stage. It does not change the scraper, classifier,
+PaddleOCR worker, or structured menu parser. It compares Google typed-menu
+offers from `restaurants.json` with verified or parser-produced offers from
+`structured-menu.json`.
+
+First create an exact image map. The command joins saved photo IDs and never
+links a photo by restaurant-name similarity:
+
+```powershell
+npm run build:photo-map -- `
+  --selection "<evaluation-selection.json>" `
+  --photo-list "output\scraper\<date>\<time>\json\photo-list.json" `
+  --output "output\photo-analysis\<date>\<time>\menu-parsing\csv\photo-map.csv"
+```
+
+Future inputs can instead put `placeId` and `photoId` directly on each
+structured image, or use the file convention `<placeId>__<photoId>.jpg`. Link
+priority is structured metadata, photo-map CSV, then the exact filename
+convention. Unresolved images are reported and are never assigned by name.
+
+Run the matcher:
+
+```powershell
+npm run match:menus -- `
+  --restaurants "output\scraper\<date>\<time>\json\restaurants.json" `
+  --structured "output\photo-analysis\<date>\<time>\menu-parsing\json\structured-menu.json" `
+  --photo-map "output\photo-analysis\<date>\<time>\menu-parsing\csv\photo-map.csv"
+```
+
+The matcher recognizes the structured input's job and writes into that same
+job's `menu-matching` stage unless `--output-dir` is supplied.
+
+The default thresholds in `config/menu-matching.json` are `0.90` for an
+accepted name and `0.75` for the review band. Variant tokens such as hot, iced,
+and sizes are compared separately. Only the verified synonym `ais → iced` is
+enabled initially. Matching is deterministic and one-to-one. A close
+alternative, ambiguous OCR pairing, unlabelled multi-price item, missing/tied
+photo dates, or conflicting prices caps the result at `REVIEW`.
+
+The matcher never fills missing prices or currencies. Numeric prices can be
+compared when one currency is absent, but `currencyCompared` remains false.
+Several unlabelled photo prices remain non-comparable instead of choosing one.
+When the same offer occurs in several photos, the newest determinable upload
+date is used; all other copies remain in `otherPhotoPrices`. Missing or tied
+dates are explicitly reviewed rather than treated as newest.
+
+Outputs are written atomically:
+
+- `menu-matches.json`: settings, place and item statuses, price comparisons,
+  evidence, estimated metrics, and optional measured evaluation;
+- `menu-matches.csv`: one flat row per comparison result; and
+- `unlinked-images.json`: every structured image that lacked an exact link.
+
+Item statuses are `MATCH`, `PRICE_DIFF`, `PRICE_NOT_COMPARABLE`, `REVIEW`,
+`ONLY_GOOGLE`, and `ONLY_PHOTO`. Place statuses preserve
+`NO_GOOGLE_MENU`, `GOOGLE_MENU_FAILED`, and `NO_MENU_PHOTOS` separately from a
+successful comparison. Provide human-labelled data matching
+`config/menu-match-ground-truth.example.json` with `--ground-truth` to add
+measured precision, recall, F1, price-verdict accuracy, and a threshold sweep.
+Without it, coverage and agreement figures are labelled estimated.
+
+Create the reader-facing workbook:
+
+```powershell
+npm run export:report -- "output\photo-analysis\<date>\<time>\menu-matching\json\menu-matches.json"
+```
+
+This writes `menu-matching/xlsx/menu-check.xlsx` in the same job with Summary, Items, Review,
+Photos, Metrics, and Info sheets. Review rows contain an Excel dropdown for
+Accept, Reject, or Correct plus manual correction fields. These decisions are
+notes only in this version and are not applied back automatically.
 
 ### Checkpoint and output details
 
@@ -1504,9 +1530,9 @@ photos. Inspect `photoScrape.tabs`. Increase `PHOTO_SCAN_LIMIT` and
 
 ### Review output is partial or failed
 
-Inspect `error`, `attempts`, `stalledScrolls`, `newestOrderViolations`, and
-`unexpandedReviewCount`. Verify the Reviews interface and requested sort with
-the dedicated profile. Use `RECON_REVIEW_PLACES` for focused retries.
+Inspect `reviewScrape.error`, `attempts`, `stalledScrolls`,
+`newestOrderViolations`, and `unexpandedReviewCount` in the place record.
+Verify the Reviews interface and requested sort with the dedicated profile.
 
 ### Photo analysis was interrupted
 
@@ -1529,7 +1555,7 @@ labeller retries atomic saves. Evaluation-only mode does not rewrite
 
 The current catalog is empty or no unique entry matched. Add evidence-backed
 Malaysia counts to `config/malaysia-chain-counts.json`, then rerun the main
-scraper or `npm run classify:chains`.
+scraper.
 
 ## Additional limitations
 
@@ -1551,23 +1577,39 @@ src/
   safe-run.js           Restartable low-memory runner
   login.js              Dedicated normal-Chrome login
   review-scraper.js     Shared privacy-limited review collection
-  recon-reviews.js      Optional independent review diagnostic
   brand-classifier.js   Malaysia brand matching and size rules
-  classify-chains.js    Standalone reclassification
-  analyze-photos.js     CLIP, OCR, checkpoints, and evaluation
+  analyze-photos.js     CLIP classification, OCR, checkpoints, and evaluation
   label-photos.js       Local browser labelling interface
+  paddleocr-menu.py     PaddleOCR worker and standalone menu-photo runner
+  parse-menu-ocr.py     Structured menu-photo parser
+  match-menus.py        Typed-menu and photo-menu matcher
+  export-results.js     Shared Excel and flat photo-list export entry point
+  common-utils.js       Shared values, CSV, file checks, and timing helpers
+  google-ui-utils.js    Shared Google consent interaction
+  excel-utils.js        Shared Excel sheet formatting
+  local-tool-utils.js   Shared local labeller HTTP and file helpers
+  output-paths.js       Shared dated/type-based JavaScript output layout
+  output_paths.py       Shared photo-analysis Python output layout
 
 config/
   malaysia-chain-counts.json
   photo-analysis-labels.csv
 
 output/
-  restaurants.json
-  restaurants.csv
-  restaurants.xlsx
-  failed-restaurants.json
-  recon-reviews/<timestamp>/
-  photo-analysis/<timestamp>/
+  scraper/<date>/<time>/
+    json/
+    csv/
+    xlsx/
+    other/
+  photo-classification/<date>/<time>/
+    json/
+    csv/
+    xlsx/
+    other/
+  photo-analysis/<date>/<time>/
+    paddleocr/{json,csv,xlsx,other}/
+    menu-parsing/{json,csv,xlsx,other}/
+    menu-matching/{json,csv,xlsx,other}/
 
 storage/                Crawlee queue and dataset state
 .chrome-profile/        Sensitive dedicated Google profile

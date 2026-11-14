@@ -21,13 +21,13 @@ missing Google value remains `null` in JSON and blank in CSV.
 To rebuild the flat files from an existing main output without scraping again:
 
 ```powershell
-npm run export:photos -- output\restaurants.json
+npm run export:photos
 ```
 
 An optional second path writes the files to another directory:
 
 ```powershell
-npm run export:photos -- output\restaurants.json output\reader-export
+npm run export:photos -- "output\scraper\<date>\<time>\json\restaurants.json"
 ```
 
 Keep these client-quality settings:
@@ -43,7 +43,7 @@ PHOTO_PROBE_CONCURRENCY=2
 ## Independent photo analyzer
 
 `src/analyze-photos.js` reads existing photo URLs; it does not launch Maps or
-change scraper output. Its default input is `output/restaurants.json`.
+change scraper output. Its default input is the newest dated scraper run.
 
 ```powershell
 npm install
@@ -53,7 +53,8 @@ npm run analyze:photos
 
 It processes every place in the input unless `PHOTO_ANALYSIS_PLACE_LIMIT` is a
 positive number. Results go to a timestamped folder under
-`output/photo-analysis/`. If interrupted, use `npm run analyze:photos:resume`.
+`output/photo-classification/<date>/<time>/`. If interrupted, use
+`npm run analyze:photos:resume`.
 The first run downloads the quantized CLIP model and official PaddleOCR models.
 PaddleOCR runs in an isolated `.venv-paddleocr` environment and uses one
 persistent worker for every automatically predicted menu photo. The default
@@ -153,8 +154,7 @@ standalone PaddleOCR folder test:
 
 ```powershell
 npm run parse:menu-ocr -- `
-  "output\paddleocr\menu-20-2026-11-10\paddleocr-analysis.json" `
-  --output-dir "output\menu-ocr-parsing\my-run"
+  "output\photo-analysis\<date>\<time>\paddleocr\json\paddleocr-analysis.json"
 ```
 
 It uses price anchors and column geometry for pairing. Fuzzy matching is only an
@@ -192,7 +192,7 @@ currency. Apply the reviewed evidence by rerunning:
 ```powershell
 npm run parse:menu-ocr -- "<paddleocr-analysis.json>" `
   --unpaired-labels "config\menu-ocr-unpaired-labels.json" `
-  --output-dir "output\menu-ocr-parsing\reviewed-run"
+  --output-dir "output\photo-analysis\<date>\<time>\menu-parsing"
 ```
 
 Only the human-verified item, variant, add-on, and bundle categories create or

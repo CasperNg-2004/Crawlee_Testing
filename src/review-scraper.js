@@ -1,3 +1,6 @@
+import { positiveInteger } from './common-utils.js';
+import { acceptGoogleConsentIfShown } from './google-ui-utils.js';
+
 export async function extractGoogleReviews(page, place, options = {}) {
   const maxReviews = positiveInteger(options.maxReviews, 50);
   const maxScrollRounds = positiveInteger(options.maxScrollRounds, 100);
@@ -16,7 +19,7 @@ export async function extractGoogleReviews(page, place, options = {}) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       await page.goto(place.googleMapsUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      await acceptConsentIfShown(page);
+    await acceptGoogleConsentIfShown(page);
       await safetyCheck();
       const heading = page.locator('div[role="main"] h1, h1').first();
       await heading.waitFor({ state: 'visible', timeout: 25_000 });
@@ -473,16 +476,6 @@ async function hasConfirmedNoReviews(page) {
   ).catch(() => false);
 }
 
-async function acceptConsentIfShown(page) {
-  for (const name of [/accept all/i, /agree/i]) {
-    const button = page.getByRole('button', { name }).first();
-    if (!await button.isVisible().catch(() => false)) continue;
-    await button.click();
-    await page.waitForTimeout(750);
-    return;
-  }
-}
-
 export function normalizeReviewSort(value) {
   const normalized = value.trim().toLowerCase();
   if (['newest', 'relevant', 'highest', 'lowest'].includes(normalized)) return normalized;
@@ -517,11 +510,6 @@ export function relativeReviewAge(value) {
     month: 2_629_800,
     year: 31_557_600,
   }[match[2]];
-}
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value ?? '', 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function clean(value) {

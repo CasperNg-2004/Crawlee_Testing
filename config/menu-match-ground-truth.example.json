@@ -1,0 +1,22 @@
+{
+  "labelledAt": "2026-11-14",
+  "places": [
+    {
+      "placeId": "ChIJexample",
+      "pairs": [
+        {
+          "googleName": "Iced Latte",
+          "photoName": "ICED LATTE",
+          "photoFile": "ChIJexample__photo-1.jpg",
+          "priceMatch": true
+        },
+        {
+          "googleName": "Teh Tarik",
+          "photoName": null,
+          "photoFile": null,
+          "priceMatch": null
+        }
+      ]
+    }
+  ]
+}

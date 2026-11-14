@@ -2,10 +2,24 @@
 // It serves only the exact local images referenced by the selected parser run
 // and atomically saves human verification to a JSON file under config/.
 
-import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
 import { basename, dirname, extname, join, resolve } from 'node:path';
+import {
+  booleanValue,
+  conciseError,
+  fileExists,
+  numberOrNull,
+  positiveInteger,
+} from './common-utils.js';
+import {
+  openBrowser,
+  readJsonBody,
+  send,
+  sendJson,
+  writeFileWithRetry,
+} from './local-tool-utils.js';
+import { findLatestOutputFile } from './output-paths.js';
 
 const CATEGORIES = [
   'item_price',
@@ -22,7 +36,7 @@ const ACTIONABLE_CATEGORIES = new Set([
 ]);
 const host = '127.0.0.1';
 const port = positiveInteger(process.env.MENU_OCR_LABEL_PORT, 3792);
-const outputRoot = resolve(process.env.MENU_OCR_PARSER_OUTPUT_DIR?.trim() || 'output/menu-ocr-parsing');
+const outputRoot = resolve(process.env.PHOTO_MENU_ANALYSIS_OUTPUT_DIR?.trim() || 'output/photo-analysis');
 const explicitInput = process.env.MENU_OCR_LABEL_INPUT?.trim();
 const labelsPath = resolve(
   process.env.MENU_OCR_UNPAIRED_LABELS?.trim() || 'config/menu-ocr-unpaired-labels.json',
@@ -237,21 +251,11 @@ function buildLabelsDocument() {
 }
 
 async function writeLabelsWithRetry(contents) {
-  const temporaryPath = `${labelsPath}.${process.pid}.tmp`;
-  let lastError = null;
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    try {
-      await writeFile(temporaryPath, contents, 'utf8');
-      await rename(temporaryPath, labelsPath);
-      return;
-    } catch (error) {
-      lastError = error;
-      await rm(temporaryPath, { force: true }).catch(() => {});
-      if (!isRetryableFileError(error) || attempt === 10) break;
-      await sleep(Math.min(150 * attempt, 1_000));
-    }
+  try {
+    await writeFileWithRetry(labelsPath, contents);
+  } catch (error) {
+    throw new Error(`Could not save ${basename(labelsPath)}: ${conciseError(error)}`);
   }
-  throw new Error(`Could not save ${basename(labelsPath)}: ${conciseError(lastError)}`);
 }
 
 async function loadLabels(path) {
@@ -270,42 +274,11 @@ async function resolveInput(value) {
 }
 
 async function findLatestStructuredMenu(root) {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const candidates = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = join(root, entry.name, 'structured-menu.json');
-    if (!await fileExists(candidate)) continue;
-    const details = await stat(candidate);
-    candidates.push({ path: candidate, modified: details.mtimeMs });
-  }
-  candidates.sort((left, right) => right.modified - left.modified);
-  return candidates[0]?.path || null;
-}
-
-async function readJsonBody(request) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > 1_000_000) throw new Error('Request body is too large.');
-    chunks.push(chunk);
-  }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-}
-
-function sendJson(response, status, value) {
-  return send(response, status, `${JSON.stringify(value)}\n`, 'application/json; charset=utf-8');
-}
-
-function send(response, status, body, contentType) {
-  response.writeHead(status, {
-    'Content-Type': contentType,
-    'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
-  });
-  response.end(body);
+  return findLatestOutputFile(root, [
+    'menu-parsing/json/structured-menu.json',
+    'json/structured-menu.json',
+    'structured-menu.json',
+  ]);
 }
 
 function imageContentType(path) {
@@ -334,54 +307,6 @@ function nullableNumber(value) {
   if (value == null || String(value).trim() === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
-}
-
-function numberOrNull(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function booleanValue(value, fallback) {
-  if (value == null || !String(value).trim()) return fallback;
-  return /^(1|true|yes|on)$/i.test(String(value).trim());
-}
-
-function isRetryableFileError(error) {
-  return ['UNKNOWN', 'EBUSY', 'EPERM', 'EACCES', 'EEXIST'].includes(error?.code);
-}
-
-function conciseError(error) {
-  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, 500);
-}
-
-async function fileExists(path) {
-  return access(path).then(() => true).catch(() => false);
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
-}
-
-function openBrowser(url) {
-  try {
-    const command = process.platform === 'win32'
-      ? spawn(process.env.ComSpec || 'cmd.exe', ['/c', 'start', '', url], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      })
-      : process.platform === 'darwin'
-        ? spawn('open', [url], { detached: true, stdio: 'ignore' })
-        : spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
-    command.unref();
-  } catch (error) {
-    console.warn(`Could not open the browser automatically: ${conciseError(error)}`);
-  }
 }
 
 const HTML = String.raw`<!doctype html>

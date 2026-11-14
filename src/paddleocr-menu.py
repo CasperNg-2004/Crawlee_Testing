@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+SRC_DIRECTORY = Path(__file__).resolve().parent
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+from output_paths import stage_output_directory, typed_output
+
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 MODEL_NAMES = {
@@ -41,9 +46,12 @@ def main() -> int:
     if not image_paths:
         raise SystemExit(f"No supported images found at {input_path}")
 
-    output_dir = Path(args.output_dir or default_output_dir()).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    visualization_dir = output_dir / "visualizations"
+    output_dir = stage_output_directory(
+        Path("output") / "photo-analysis",
+        "paddleocr",
+        explicit=args.output_dir,
+    )
+    visualization_dir = output_dir / "other" / "visualizations"
     if args.save_visualizations:
         visualization_dir.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +93,7 @@ def main() -> int:
         },
         "images": [],
     }
-    write_json(output_dir / "paddleocr-analysis.partial.json", report)
+    write_json(typed_output(output_dir, "json", "paddleocr-analysis.partial.json"), report)
 
     overall_started = time.perf_counter()
     pipeline_started = time.perf_counter()
@@ -133,7 +141,7 @@ def main() -> int:
 
         report["images"].append(image_result)
         refresh_counts(report)
-        write_json(output_dir / "paddleocr-analysis.partial.json", report)
+        write_json(typed_output(output_dir, "json", "paddleocr-analysis.partial.json"), report)
         print(
             f"  {image_result['status']} lines={image_result['lineCount']} "
             f"prices={len(image_result['priceCandidates'])} "
@@ -154,8 +162,8 @@ def main() -> int:
         time.perf_counter() - overall_started, 3
     )
     refresh_counts(report)
-    write_json(output_dir / "paddleocr-analysis.json", report)
-    write_json(output_dir / "paddleocr-analysis.partial.json", report)
+    write_json(typed_output(output_dir, "json", "paddleocr-analysis.json"), report)
+    write_json(typed_output(output_dir, "json", "paddleocr-analysis.partial.json"), report)
 
     print(
         "PADDLEOCR_SUMMARY "
@@ -164,7 +172,7 @@ def main() -> int:
                 "status": report["status"],
                 **report["counts"],
                 **report["timing"],
-                "output": str(output_dir / "paddleocr-analysis.json"),
+                "output": str(typed_output(output_dir, "json", "paddleocr-analysis.json")),
             },
             ensure_ascii=False,
         )
@@ -465,11 +473,6 @@ def write_json(path: Path, value: Any) -> None:
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     temporary_path.replace(path)
-
-
-def default_output_dir() -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
-    return str(Path("output") / "paddleocr" / timestamp)
 
 
 def iso_now() -> str:

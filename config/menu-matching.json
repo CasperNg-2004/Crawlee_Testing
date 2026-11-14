@@ -1,0 +1,30 @@
+{
+  "acceptThreshold": 0.9,
+  "reviewThreshold": 0.75,
+  "closeAlternativeDelta": 0.03,
+  "variantTokens": {
+    "temperature": {
+      "hot": "hot",
+      "panas": "hot",
+      "iced": "iced",
+      "ice": "iced",
+      "ais": "iced",
+      "cold": "iced",
+      "sejuk": "iced"
+    },
+    "size": {
+      "s": "small",
+      "small": "small",
+      "m": "medium",
+      "medium": "medium",
+      "regular": "medium",
+      "reg": "medium",
+      "l": "large",
+      "large": "large",
+      "lg": "large"
+    }
+  },
+  "synonyms": {
+    "ais": "iced"
+  }
+}

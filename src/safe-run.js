@@ -1,6 +1,12 @@
 import { spawn } from 'node:child_process';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { positiveInteger } from './common-utils.js';
+import {
+  createOutputRun,
+  findLatestOutputRun,
+  outputFile,
+} from './output-paths.js';
 
 const resume = process.argv.includes('--resume');
 const batchSize = positiveInteger(process.env.SAFE_BATCH_SIZE, 4);
@@ -27,6 +33,15 @@ const plannedDetailCount = directPlaceCount || maxPlaces;
 const discoveryRequestCount = directPlaceCount ? 0 : areas.length * queries.length;
 const plannedRequestCount = discoveryRequestCount + plannedDetailCount;
 const storageDir = resolve(process.env.CRAWLEE_STORAGE_DIR?.trim() || 'storage');
+const outputBaseDir = resolve(process.env.OUTPUT_DIR?.trim() || 'output/scraper');
+const outputRunDir = resume
+  ? await findLatestOutputRun(outputBaseDir, 'other/safe-run.json')
+  : await createOutputRun(outputBaseDir);
+if (!outputRunDir) {
+  throw new Error('No resumable scraper output run was found. Use `npm run start:safe` for a fresh run.');
+}
+const safeRunStartedAt = new Date().toISOString();
+await writeSafeRunState('running');
 
 let freshRun = !resume;
 let consecutiveFailures = 0;
@@ -39,6 +54,7 @@ console.log(
   + `in batches of ${batchSize} restaurant(s).`,
 );
 console.log('[safe-run] Chrome will close between batches to release memory and the profile lock.');
+console.log(`[safe-run] Output run: ${outputRunDir}`);
 
 while (true) {
   const before = freshRun ? emptyState() : await readCrawlState(storageDir);
@@ -73,9 +89,11 @@ while (true) {
   lastExitCode = await runMain({
     purgeOnStart: freshRun,
     maxRequestsPerCrawl: target,
+    outputRunDir,
   });
 
   const after = await readCrawlState(storageDir);
+  await writeSafeRunState(lastExitCode === 2 ? 'safety_stopped' : 'running', after);
   const madeProgress = after.queue.handled > before.queue.handled || after.processed > before.processed;
 
   if (lastExitCode === 2) {
@@ -159,12 +177,13 @@ if (safetyStopped) {
 } else {
   console.log(
     `[safe-run] Complete. ${finalState.queue.handled}/${finalState.queue.total} requests handled. `
-    + 'Final outputs are in the configured output directory.',
+    + `Final outputs are in ${outputRunDir}.`,
   );
 }
+await writeSafeRunState(safetyStopped ? 'safety_stopped' : 'complete', finalState);
 process.exitCode = safetyStopped ? 2 : overallExitCode;
 
-function runMain({ purgeOnStart, maxRequestsPerCrawl }) {
+function runMain({ purgeOnStart, maxRequestsPerCrawl, outputRunDir: runDirectory }) {
   return new Promise((resolveExit) => {
     const child = spawn(
       process.execPath,
@@ -176,6 +195,7 @@ function runMain({ purgeOnStart, maxRequestsPerCrawl }) {
           ...process.env,
           CRAWLEE_PURGE_ON_START: purgeOnStart ? '1' : '0',
           MAX_REQUESTS_PER_CRAWL: String(maxRequestsPerCrawl),
+          OUTPUT_RUN_DIR: runDirectory,
         },
       },
     );
@@ -189,6 +209,19 @@ function runMain({ purgeOnStart, maxRequestsPerCrawl }) {
       resolveExit(code ?? 1);
     });
   });
+}
+
+async function writeSafeRunState(status, crawlState = null) {
+  const state = {
+    status,
+    startedAt: safeRunStartedAt,
+    updatedAt: new Date().toISOString(),
+    storageDir,
+    outputRunDir,
+    queue: crawlState?.queue ?? null,
+    processed: crawlState?.processed ?? null,
+  };
+  await writeFile(outputFile(outputRunDir, 'other', 'safe-run.json'), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
 
 async function readCrawlState(root) {
@@ -226,11 +259,6 @@ function emptyState() {
     queue: { total: 0, handled: 0, pending: 0 },
     processed: 0,
   };
-}
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function delay(milliseconds) {
