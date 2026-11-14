@@ -21,48 +21,246 @@ The classification and analysis stages do not modify the selected scraper
 `restaurants.json`. A new scrape creates `Running#1`, then `Running#2`, and so
 on; every later stage for that scrape stays inside the same numbered folder.
 
-## End-to-end workflow
+## Step-by-step guide: login to `menu-check.xlsx`
 
-After installation and the one-time Google login, the normal sequence is:
+This is the recommended integrated workflow for a new user. Replace `Running#N`
+in later commands with the numbered folder created by the scrape, for example
+`Running#1`. Keep every stage on the same number so its place IDs, photo IDs,
+typed menus, OCR evidence, and comparison results remain linked.
+
+### Step 0 — Install the project once
+
+Open PowerShell in the repository and run:
 
 ```powershell
-# Main location, menu, Popular-times, About, photo, and review scrape.
-npm run start:safe
-
-# One-time setup before the first PaddleOCR analysis.
+npm install
+npx playwright install chromium
+Copy-Item .env.example .env
 npm run setup:paddleocr
-
-# Independent CLIP classification and PaddleOCR of the saved photo URLs.
-npm run analyze:photos
-
-# Convert a PaddleOCR result into evidence-backed structured menu candidates.
-npm run parse:menu-ocr -- "output\Running#N\photo-analysis\paddleocr\json\paddleocr-analysis.json"
-
-# Manually categorize unresolved OCR price lines in a local browser.
-npm run label:menu-ocr
-
-# Build an exact file-to-place photo map for downloaded OCR images.
-npm run build:photo-map -- --selection "<selection.json>" --photo-list "output\Running#N\scraper\json\photo-list.json" --output "<photo-map.csv>"
-
-# Match Google typed-menu offers against structured photo-menu offers.
-npm run match:menus -- --restaurants "output\Running#N\scraper\json\restaurants.json" --structured "<structured-menu.json>" --photo-map "<photo-map.csv>"
-
-# Export the menu matching result to a client-readable Excel workbook.
-npm run export:report -- "<menu-matches.json>"
-
-# Manual image-category and optional OCR-text validation.
-npm run label:photos
-
-# Accuracy, precision, recall, F1, confusion matrix, and optional OCR accuracy.
-npm run analyze:photos:evaluate
-
-# Optional standalone menu-photo benchmark.
-npm run recon:paddleocr -- "C:\path\to\menu-photos"
 ```
 
-Photo classification and analysis run after the main scrape. Do not run
-`npm run login` and a main scrape simultaneously because they share
+Skip the `Copy-Item` command when a configured `.env` already exists. The first
+CLIP and PaddleOCR run downloads model files; later runs reuse the local caches.
+
+### Step 1 — Sign in to the dedicated Google profile
+
+```powershell
+npm run login
+```
+
+In the Chrome window that opens:
+
+1. Sign in to the Google account used for Maps.
+2. Open Google Maps and confirm that place pages show Menu, Reviews, and Photos.
+3. Close every Chrome window opened by this command.
+4. Return to PowerShell and press Enter if requested.
+
+This is normally a one-time action. Run it again only when Google signs the
+profile out. Never run login and scraping together because both use
 `.chrome-profile`.
+
+### Step 2 — Set the scrape input in `.env`
+
+For client-supplied places, use one of these pipe-separated inputs:
+
+```dotenv
+PLACE_IDS=ChIJ...|ChIJ...
+PLACE_URLS=https://www.google.com/maps/search/?api=1&query=Example&query_place_id=ChIJ...|https://...
+MAX_PLACES=20
+```
+
+Clear `PLACE_IDS` and `PLACE_URLS` when using area discovery instead:
+
+```dotenv
+QUERIES=cafes|drinks
+AREAS=Kuala Lumpur City Centre|Bukit Bintang, Kuala Lumpur|Bangsar, Kuala Lumpur
+MAX_PLACES=20
+```
+
+For the client-quality photo route, keep:
+
+```dotenv
+HEADLESS=true
+SCRAPE_PHOTOS=true
+PHOTO_TABS=Menu|By owner|All|Food & drink|Vibe
+PHOTO_CAPTURE_UPLOAD_DATE=true
+PHOTO_DATE_CONCURRENCY=1
+PHOTO_ANALYSIS_OCR_ENGINE=paddleocr
+```
+
+`MAX_PLACES` is the shared final cap. It is not applied once per area. Leave the
+photo-analysis place limit empty or set it to `all` when every scraped place
+must be analyzed.
+
+### Step 3 — Run the scraper
+
+```powershell
+npm run start:safe
+```
+
+Safe mode closes Chrome between small batches to release memory. If a safety
+stop or interruption occurs and the input has not changed, continue the same
+queue with:
+
+```powershell
+npm run resume:safe
+```
+
+Do not use `resume:safe` for a different target list. A new scrape creates the
+next folder, such as:
+
+```text
+output\Running#1\scraper\
+  json\restaurants.json
+  json\photo-list.json
+  csv\restaurants.csv
+  csv\photo-list.csv
+  xlsx\restaurants.xlsx
+  other\run-summary.json
+```
+
+Before continuing, check `run-summary.json` and the terminal `RUN_SUMMARY` line.
+Confirm that the expected places completed and that menu, photo, and review
+statuses are not unexpectedly `failed`.
+
+### Step 4 — Classify photos and run PaddleOCR
+
+```powershell
+npm run analyze:photos
+```
+
+The command finds the newest scraper run, analyzes all of its saved photo URLs,
+uses CLIP to classify them as menu, food, interior, or unknown, and runs
+PaddleOCR on menu-photo candidates. Its integrated result is:
+
+```text
+output\Running#N\photo-classification\json\photo-analysis.json
+```
+
+If the process is interrupted, resume its checkpoint with:
+
+```powershell
+npm run analyze:photos:resume
+```
+
+### Step 5 — Review photo categories and measure accuracy
+
+Open the local labelling website:
+
+```powershell
+npm run label:photos
+```
+
+Check each image, choose its real category, and save it. Labels stay with the
+same numbered run in:
+
+```text
+output\Running#N\photo-classification\csv\photo-analysis-labels.csv
+```
+
+Then recalculate classification precision, recall, F1, and the confusion matrix:
+
+```powershell
+npm run analyze:photos:evaluate
+```
+
+For an optional character-level OCR check, run `npm run label:ocr`, correct the
+recognized text against the visible menu photo, save it, and run the evaluation
+command again. `label:ocr` measures OCR accuracy; it does not silently replace
+the raw OCR evidence used by the menu parser.
+
+### Step 6 — Convert OCR evidence into structured menu items
+
+Run the parser directly on the integrated photo-analysis result:
+
+```powershell
+npm run parse:menu-ocr -- `
+  "output\Running#N\photo-classification\json\photo-analysis.json"
+```
+
+The parser uses OCR layout geometry to associate names, descriptions, and price
+lines. It never invents a missing price or currency. The main result is:
+
+```text
+output\Running#N\photo-analysis\menu-parsing\json\structured-menu.json
+```
+
+It also produces `structured-menu.csv`, `ambiguous-items.json`,
+`unpaired-lines.json`, `evaluation.json`, and a human ground-truth template.
+
+### Step 7 — Review unresolved OCR lines when needed
+
+```powershell
+npm run label:menu-ocr
+```
+
+The local page displays unresolved price lines with their source images. Save
+only information that is visibly confirmed in the photo. Then rerun the parser
+with the saved review labels:
+
+```powershell
+npm run parse:menu-ocr -- `
+  "output\Running#N\photo-classification\json\photo-analysis.json" `
+  --unpaired-labels "config\menu-ocr-unpaired-labels.json" `
+  --output-dir "output\Running#N\photo-analysis\menu-parsing"
+```
+
+This step is optional when there are no unresolved lines or no manual review is
+required.
+
+### Step 8 — Match photo-menu items with Google typed-menu items
+
+The integrated result already retains exact place IDs and photo IDs, so it does
+not require a separate photo map:
+
+```powershell
+npm run match:menus -- `
+  --restaurants "output\Running#N\scraper\json\restaurants.json" `
+  --structured "output\Running#N\photo-analysis\menu-parsing\json\structured-menu.json"
+```
+
+The comparison is written to:
+
+```text
+output\Running#N\photo-analysis\menu-matching\json\menu-matches.json
+```
+
+`build:photo-map` is only needed for a standalone external/downloaded image set
+that does not already contain exact place and photo IDs.
+
+### Step 9 — Generate `menu-check.xlsx`
+
+```powershell
+npm run export:report -- `
+  "output\Running#N\photo-analysis\menu-matching\json\menu-matches.json"
+```
+
+The final reader-facing workbook is:
+
+```text
+output\Running#N\photo-analysis\menu-matching\xlsx\menu-check.xlsx
+```
+
+Start with its `Summary` sheet, use `Items` for the full comparison ledger, and
+use `Review` for uncertain matches and price differences. The workbook also
+contains `Photos`, `Metrics`, and `Info` audit sheets. Manual Excel decisions
+are notes only and are not written back to JSON automatically.
+
+### Short command checklist
+
+After the one-time installation and login, the normal command order is:
+
+```powershell
+npm run start:safe
+npm run analyze:photos
+npm run label:photos
+npm run analyze:photos:evaluate
+npm run parse:menu-ocr -- "output\Running#N\photo-classification\json\photo-analysis.json"
+npm run label:menu-ocr
+npm run parse:menu-ocr -- "output\Running#N\photo-classification\json\photo-analysis.json" --unpaired-labels "config\menu-ocr-unpaired-labels.json" --output-dir "output\Running#N\photo-analysis\menu-parsing"
+npm run match:menus -- --restaurants "output\Running#N\scraper\json\restaurants.json" --structured "output\Running#N\photo-analysis\menu-parsing\json\structured-menu.json"
+npm run export:report -- "output\Running#N\photo-analysis\menu-matching\json\menu-matches.json"
+```
 
 ## Current capabilities
 
@@ -149,6 +347,36 @@ The validated low-memory photo-analysis setup uses CPU inference with the
 quantized model. More RAM reduces Windows swapping and Chrome crashes. Faster
 internet improves discovery, detail pages, review scrolling, and photo
 downloads. GPU acceleration is not enabled in the validated configuration.
+
+## Technologies and external dependencies
+
+The pipeline combines local browser automation, image processing, machine
+learning, OCR, deterministic parsing, and spreadsheet export. Besides Crawlee,
+CLIP, and PaddleOCR, it uses:
+
+| Component | Role in this project |
+| --- | --- |
+| Playwright and Chromium/Chrome | Control Google Maps, open tabs, scroll dynamic panels, and extract page data. Crawlee manages the crawl while Playwright controls the browser. |
+| Hugging Face Transformers.js | Load and run the local CLIP model. The default model is `Xenova/clip-vit-base-patch32`. |
+| PaddlePaddle | Local inference runtime underneath PaddleOCR. The pinned Python environment currently uses `paddlepaddle==3.3.1`. |
+| Sharp | Decode, resize, convert, and sharpen downloaded images before classification or OCR. |
+| ExcelJS | Generate `restaurants.xlsx`, photo-list workbooks, and `menu-check.xlsx`. |
+| Python `SequenceMatcher` | Provide deterministic fuzzy name validation during menu comparison. It does not decide which price belongs to an OCR item. |
+| Custom parsing and matching rules | Detect price columns, pair OCR lines using layout geometry, normalize currencies, preserve ambiguous evidence, and compare typed and photographed menu offers. |
+| Local browser labellers | Review photo categories, corrected OCR text, and unresolved menu lines through local HTTP pages without sending the labels to an external service. |
+| Tesseract.js | Optional historical OCR fallback. PaddleOCR is the default engine for current analysis runs. |
+| Cross-env | Set command-specific environment variables consistently on Windows. |
+
+Google Maps is the external data source, and Google-hosted full-size image URLs
+provide the photos. The first CLIP run downloads its model from Hugging Face;
+the first PaddleOCR run downloads the official OCR models. The cached models
+are reused locally afterwards.
+
+The project does **not** currently use OpenAI, Claude, Gemini, Google Places
+API, a paid OCR API, cloud storage, an external database, or a cloud fuzzy-match
+service. After dependencies and models are downloaded, classification, OCR,
+parsing, matching, evaluation, and Excel generation run locally on the computer.
+The validated configuration uses CPU inference rather than GPU acceleration.
 
 ## Installation
 
@@ -1257,7 +1485,10 @@ PaddleOCR worker, or structured menu parser. It compares Google typed-menu
 offers from `restaurants.json` with verified or parser-produced offers from
 `structured-menu.json`.
 
-First create an exact image map. The command joins saved photo IDs and never
+The normal integrated workflow preserves `placeId` and `photoId` from
+`photo-analysis.json` through `structured-menu.json`, so run the matcher without
+a separate photo map. For a standalone OCR selection that lacks these IDs,
+create an exact image map first. The command joins saved photo IDs and never
 links a photo by restaurant-name similarity:
 
 ```powershell
