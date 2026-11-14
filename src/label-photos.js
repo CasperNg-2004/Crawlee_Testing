@@ -4,7 +4,7 @@
 
 import { mkdir, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { basename, dirname, extname, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import {
   booleanValue,
   conciseError,
@@ -27,6 +27,7 @@ import {
   outputFile,
   outputRunForFile,
 } from './output-paths.js';
+import { createOcrVisualization, ocrVisualizationFileName } from './ocr-visualization.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const host = '127.0.0.1';
@@ -52,6 +53,8 @@ if (!inputPath) throw new Error(`No completed photo-analysis.json was found unde
 const labelsPath = process.env.PHOTO_ANALYSIS_LABELS?.trim()
   ? resolve(process.env.PHOTO_ANALYSIS_LABELS.trim())
   : outputFile(outputRunForFile(inputPath), 'csv', 'photo-analysis-labels.csv');
+const classificationRunRoot = outputRunForFile(inputPath);
+const ocrVisualizationDir = join(classificationRunRoot, 'other', 'ocr-visualizations');
 
 const report = JSON.parse(await readFile(inputPath, 'utf8'));
 const records = flattenPhotoRecords(report);
@@ -74,6 +77,25 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(response, 200, buildState());
+    }
+    if (request.method === 'GET' && url.pathname.startsWith('/api/ocr-visualization/')) {
+      const photoId = decodeURIComponent(url.pathname.slice('/api/ocr-visualization/'.length));
+      const record = recordById.get(photoId);
+      if (!record) return sendJson(response, 404, { error: 'Photo ID was not found.' });
+      if (!record.ocrLines.length) {
+        return sendJson(response, 404, { error: 'This photo has no PaddleOCR text boxes.' });
+      }
+      const visualizationPath = join(ocrVisualizationDir, ocrVisualizationFileName(photoId));
+      if (!await fileExists(visualizationPath)) {
+        const imageBuffer = await downloadForVisualization(record.imageUrl);
+        await createOcrVisualization({
+          imageBuffer,
+          lines: record.ocrLines,
+          priceCandidates: record.ocrPriceCandidates,
+          outputPath: visualizationPath,
+        });
+      }
+      return send(response, 200, await readFile(visualizationPath), 'image/jpeg');
     }
     if (request.method === 'GET' && url.pathname === '/api/export') {
       const csv = buildLabelsCsv(records, labels);
@@ -156,11 +178,14 @@ function buildState() {
     ocrEligible: ocrEvaluation.eligibleImages,
     ocrReviewed: ocrEvaluation.labelledImages,
     ocrMeanCharacterAccuracy: ocrEvaluation.meanCharacterAccuracy,
-    records: records.map((record) => ({
-      ...record,
-      actualCategory: labels.get(record.photoId)?.actualCategory || null,
-      expectedOcrText: labels.get(record.photoId)?.expectedOcrText || '',
-    })),
+    records: records.map((record) => {
+      const { ocrLines, ocrPriceCandidates, ...browserRecord } = record;
+      return {
+        ...browserRecord,
+        actualCategory: labels.get(record.photoId)?.actualCategory || null,
+        expectedOcrText: labels.get(record.photoId)?.expectedOcrText || '',
+      };
+    }),
   };
 }
 
@@ -237,12 +262,44 @@ function flattenPhotoRecords(value) {
           : null,
         ocrElapsedSeconds: numberOrNull(image.ocr?.elapsedSeconds),
         ocrText: image.ocr?.text || null,
+        ocrDisplayText: Array.isArray(image.ocr?.lines) && image.ocr.lines.length
+          ? image.ocr.lines.map((line, lineIndex) => {
+            const score = Number(line?.confidence);
+            const confidence = Number.isFinite(score) ? ` · ${Math.round(score * 100)}%` : '';
+            return `${lineIndex + 1}. ${line?.text || ''}${confidence}`;
+          }).join('\n')
+          : image.ocr?.text || null,
+        ocrLines: Array.isArray(image.ocr?.lines) ? image.ocr.lines : [],
+        ocrPriceCandidates: Array.isArray(image.ocr?.priceCandidates)
+          ? image.ocr.priceCandidates
+          : [],
+        ocrVisualizationUrl: Array.isArray(image.ocr?.lines) && image.ocr.lines.length
+          ? `/api/ocr-visualization/${encodeURIComponent(image.photoId)}`
+          : null,
         originalWidth: numberOrNull(image.originalWidth),
         originalHeight: numberOrNull(image.originalHeight),
       });
     }
   }
   return flattened;
+}
+
+async function downloadForVisualization(url) {
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 OCR-visualization/1.0' },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error(`Image download returned HTTP ${response.status}.`);
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.startsWith('image/')) throw new Error('OCR source URL did not return an image.');
+  const declaredBytes = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredBytes) && declaredBytes > 30_000_000) {
+    throw new Error('OCR source image is larger than 30 MB.');
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('OCR source image was empty.');
+  if (buffer.length > 30_000_000) throw new Error('OCR source image is larger than 30 MB.');
+  return buffer;
 }
 
 async function queueSave() {
@@ -327,6 +384,7 @@ const HTML = String.raw`<!doctype html>
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; }
     .viewer { min-height:calc(100vh - 110px); display:flex; flex-direction:column; overflow:hidden; }
     .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--line); }
+    .view-button.active { border-color:#7ec4ff; background:#175b96; }
     select,input { color:var(--text); background:#18243a; border:1px solid #34435d; border-radius:7px; padding:7px 9px; }
     input { min-width:210px; }
     .image-stage { position:relative; flex:1; min-height:480px; display:flex; align-items:center; justify-content:center; padding:12px; background:#070c14; }
@@ -376,6 +434,9 @@ const HTML = String.raw`<!doctype html>
         </select>
         <input id="search" type="search" placeholder="Filter restaurant name">
         <span id="filteredCount" class="muted"></span>
+        <span style="flex:1"></span>
+        <button id="showOriginal" class="view-button active" type="button">Original</button>
+        <button id="showOcr" class="view-button" type="button">OCR boxes</button>
       </div>
       <div class="image-stage">
         <span id="loading" class="loading">Loading photo…</span>
@@ -412,14 +473,15 @@ const HTML = String.raw`<!doctype html>
         <button id="saveText">Save category and OCR text</button>
         <button id="clearLabel">Clear label</button>
         <a id="fullSize" class="link-button" target="_blank" rel="noreferrer">Open full size</a>
+        <a id="ocrImage" class="link-button" target="_blank" rel="noreferrer">Open OCR boxes</a>
         <a href="/api/export" class="link-button">Download labels CSV</a>
       </div>
       <div id="shortcuts" class="shortcuts">Keyboard: 1 Menu · 2 Food · 3 Interior · 4 Unknown · ← Previous · → Next · S Skip. Every category choice autosaves.</div>
     </aside>
   </main>
   <script>
-    const state = { all: [], filtered: [], index: 0, total: 0, labelled: 0, mode: 'classification', ocrEligible: 0, ocrReviewed: 0, ocrMeanCharacterAccuracy: null, saving: false };
-    const elements = Object.fromEntries(['pageTitle','fileInfo','progressText','progressBar','filter','search','filteredCount','loading','photo','imageError','previous','skip','next','position','restaurant','meta','chips','prediction','scores','categoryPrompt','categoryButtons','expectedOcr','ocrMeta','ocrText','status','saveText','clearLabel','fullSize','copyOcr','shortcuts'].map(id => [id, document.getElementById(id)]));
+    const state = { all: [], filtered: [], index: 0, total: 0, labelled: 0, mode: 'classification', imageView: 'original', ocrEligible: 0, ocrReviewed: 0, ocrMeanCharacterAccuracy: null, saving: false };
+    const elements = Object.fromEntries(['pageTitle','fileInfo','progressText','progressBar','filter','search','filteredCount','loading','photo','imageError','showOriginal','showOcr','previous','skip','next','position','restaurant','meta','chips','prediction','scores','categoryPrompt','categoryButtons','expectedOcr','ocrMeta','ocrText','status','saveText','clearLabel','fullSize','ocrImage','copyOcr','shortcuts'].map(id => [id, document.getElementById(id)]));
 
     init().catch(error => setStatus(error.message, true));
 
@@ -435,6 +497,7 @@ const HTML = String.raw`<!doctype html>
       state.ocrReviewed = data.ocrReviewed;
       state.ocrMeanCharacterAccuracy = data.ocrMeanCharacterAccuracy;
       if (state.mode === 'ocr') {
+        state.imageView = 'ocr';
         elements.pageTitle.textContent = 'OCR character accuracy reviewer';
         elements.filter.value = 'ocr-unreviewed';
         elements.categoryPrompt.style.display = 'none';
@@ -490,14 +553,16 @@ const HTML = String.raw`<!doctype html>
       elements.loading.style.display = 'block';
       elements.imageError.style.display = 'none';
       elements.photo.style.display = 'block';
-      elements.photo.src = record.imageUrl;
+      renderImage(record);
       elements.restaurant.textContent = record.restaurantName;
       elements.meta.textContent = (record.area || 'Area unavailable') + ' · restaurant photo ' + record.restaurantPhotoIndex;
       elements.position.textContent = (state.index + 1) + ' / ' + state.filtered.length + ' shown · photo ' + record.sequence + ' / ' + state.total;
       elements.prediction.textContent = (record.predictedCategory || 'none') + ' (' + percent(record.confidence) + ')';
       elements.fullSize.href = record.fullSizeImageUrl;
+      elements.ocrImage.href = record.ocrVisualizationUrl || '#';
+      elements.ocrImage.style.display = record.ocrVisualizationUrl ? '' : 'none';
       elements.expectedOcr.value = record.expectedOcrText || '';
-      elements.ocrText.textContent = record.ocrText || 'No OCR text';
+      elements.ocrText.textContent = record.ocrDisplayText || 'No OCR text';
       elements.ocrMeta.textContent = record.ocrStatus
         ? [
             record.ocrEngine || 'OCR',
@@ -505,6 +570,7 @@ const HTML = String.raw`<!doctype html>
             record.ocrConfidence == null ? null : Math.round(record.ocrConfidence) + '% confidence',
             record.ocrPriceCandidateCount == null ? null : record.ocrPriceCandidateCount + ' price candidates',
             record.ocrElapsedSeconds == null ? null : record.ocrElapsedSeconds + 's',
+            record.ocrVisualizationUrl ? 'cyan=text · amber=price' : null,
           ].filter(Boolean).join(' · ')
         : 'not attempted';
       elements.chips.replaceChildren(...[
@@ -596,6 +662,22 @@ const HTML = String.raw`<!doctype html>
     }
 
     function current() { return state.filtered[state.index] || null; }
+    function setImageView(view) {
+      state.imageView = view;
+      const record = current();
+      if (record) renderImage(record);
+    }
+    function renderImage(record) {
+      const showOcr = state.imageView === 'ocr' && record.ocrVisualizationUrl;
+      elements.loading.style.display = 'block';
+      elements.imageError.style.display = 'none';
+      elements.photo.style.display = 'block';
+      elements.photo.dataset.view = showOcr ? 'ocr' : 'original';
+      elements.photo.src = showOcr ? record.ocrVisualizationUrl : record.imageUrl;
+      elements.showOriginal.classList.toggle('active', !showOcr);
+      elements.showOcr.classList.toggle('active', Boolean(showOcr));
+      elements.showOcr.disabled = !record.ocrVisualizationUrl;
+    }
     function updateProgress() {
       const completed = state.mode === 'ocr' ? state.ocrReviewed : state.labelled;
       const total = state.mode === 'ocr' ? state.ocrEligible : state.total;
@@ -613,9 +695,21 @@ const HTML = String.raw`<!doctype html>
     function preloadNext() { const next = state.filtered[state.index + 1]; if (next) { const image = new Image(); image.src = next.imageUrl; } }
 
     elements.photo.addEventListener('load', () => { elements.loading.style.display = 'none'; elements.imageError.style.display = 'none'; });
-    elements.photo.addEventListener('error', () => { elements.loading.style.display = 'none'; elements.photo.style.display = 'none'; elements.imageError.style.display = 'block'; });
+    elements.photo.addEventListener('error', () => {
+      if (elements.photo.dataset.view === 'ocr' && current()?.imageUrl) {
+        state.imageView = 'original';
+        setStatus('The OCR visualization could not be created; showing the original photo.', true);
+        renderImage(current());
+        return;
+      }
+      elements.loading.style.display = 'none';
+      elements.photo.style.display = 'none';
+      elements.imageError.style.display = 'block';
+    });
     elements.filter.addEventListener('change', () => applyFilter(true));
     elements.search.addEventListener('input', () => applyFilter(true));
+    elements.showOriginal.addEventListener('click', () => setImageView('original'));
+    elements.showOcr.addEventListener('click', () => setImageView('ocr'));
     elements.previous.addEventListener('click', () => move(-1));
     elements.next.addEventListener('click', () => move(1));
     elements.skip.addEventListener('click', () => move(1));

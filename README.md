@@ -131,10 +131,13 @@ npm run analyze:photos
 
 The command finds the newest scraper run, analyzes all of its saved photo URLs,
 uses CLIP to classify them as menu, food, interior, or unknown, and runs
-PaddleOCR on menu-photo candidates. Its integrated result is:
+PaddleOCR on menu-photo candidates. For every successful PaddleOCR result, it
+also saves an annotated JPEG: cyan polygons mark recognized text and amber
+polygons mark lines detected as possible prices. Its integrated results are:
 
 ```text
 output\Running#N\photo-classification\json\photo-analysis.json
+output\Running#N\photo-classification\other\ocr-visualizations\*-ocr.jpg
 ```
 
 If the process is interrupted, resume its checkpoint with:
@@ -166,8 +169,12 @@ npm run analyze:photos:evaluate
 
 For an optional character-level OCR check, run `npm run label:ocr`, correct the
 recognized text against the visible menu photo, save it, and run the evaluation
-command again. `label:ocr` measures OCR accuracy; it does not silently replace
-the raw OCR evidence used by the menu parser.
+command again. The website has **Original** and **OCR boxes** buttons so the
+source photo and PaddleOCR detections can be compared. For an older run without
+saved annotated files, opening **OCR boxes** creates the corresponding JPEG in
+that run's `other/ocr-visualizations` folder on demand. `label:ocr` measures OCR
+accuracy; it does not silently replace the raw OCR evidence used by the menu
+parser.
 
 ### Step 6 — Convert OCR evidence into structured menu items
 
@@ -1315,7 +1322,10 @@ grayscale/normalized Tesseract path.
   `menu`.
 
 New PaddleOCR records also contain `ocr.engine`, `ocr.modelSize`, positioned
-`ocr.lines`, `ocr.priceCandidates`, and `ocr.elapsedSeconds`. Existing
+`ocr.lines`, `ocr.priceCandidates`, `ocr.elapsedSeconds`, and
+`ocr.visualization`. The visualization record reports its status, relative
+output path, dimensions, recognized-line count, and highlighted price-line
+count. Existing
 Tesseract result folders are not rewritten or deleted. A resumed checkpoint
 must use the same OCR engine with which it started, preventing mixed results.
 

@@ -40,6 +40,7 @@ import {
   outputRunForFile,
   pipelineRunForFile,
 } from './output-paths.js';
+import { createOcrVisualization, ocrVisualizationFileName } from './ocr-visualization.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const PROMPTS = {
@@ -157,6 +158,7 @@ async function runAnalysis() {
   const labelsPath = labelsPathForRun(runRoot);
   const partialPath = outputFile(runRoot, 'json', 'photo-analysis.partial.json');
   const finalPath = outputFile(runRoot, 'json', 'photo-analysis.json');
+  const ocrVisualizationDir = join(runRoot, 'other', 'ocr-visualizations');
   const startedAt = new Date();
   const report = resumedRun
     ? JSON.parse(await readFile(partialPath, 'utf8'))
@@ -219,7 +221,7 @@ async function runAnalysis() {
               : await createTesseractOcrRunner();
           }
           return ocrRunner;
-        });
+        }, ocrVisualizationDir);
         imageResults.push(result);
         const ocrText = result.ocr?.status === 'success'
           ? ` OCR=${Math.round(result.ocr.confidence)}%`
@@ -262,7 +264,7 @@ async function runAnalysis() {
   }
 }
 
-async function analyzePhoto(photo, classifier, getOcrWorker) {
+async function analyzePhoto(photo, classifier, getOcrWorker, ocrVisualizationDir) {
   const sourceUrl = photo?.fullSizeImageUrl || photo?.sourceImageUrl || null;
   const base = {
     photoId: photo?.photoId ?? null,
@@ -312,6 +314,29 @@ async function analyzePhoto(photo, classifier, getOcrWorker) {
           : await downloadImage(ocrUrl, requestTimeoutMs);
         const runner = await getOcrWorker();
         result.ocr = await runner.recognize(ocrDownloaded.buffer);
+        if (result.ocr.status === 'success' && result.ocr.lines?.length) {
+          try {
+            const visualizationFileName = ocrVisualizationFileName(result.photoId);
+            const visualizationPath = join(ocrVisualizationDir, visualizationFileName);
+            const visualization = await createOcrVisualization({
+              imageBuffer: ocrDownloaded.buffer,
+              lines: result.ocr.lines,
+              priceCandidates: result.ocr.priceCandidates,
+              outputPath: visualizationPath,
+            });
+            result.ocr.visualization = {
+              status: 'success',
+              relativePath: `other/ocr-visualizations/${visualizationFileName}`,
+              ...visualization,
+            };
+          } catch (visualizationError) {
+            result.ocr.visualization = {
+              status: 'failed',
+              relativePath: null,
+              error: conciseError(visualizationError),
+            };
+          }
+        }
       } catch (error) {
         result.ocr = {
           status: 'failed',
