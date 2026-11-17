@@ -19,6 +19,7 @@ import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
 import { env, pipeline, RawImage } from '@huggingface/transformers';
 import {
+  booleanValue,
   conciseError,
   csvCell,
   fileExists,
@@ -40,7 +41,12 @@ import {
   outputRunForFile,
   pipelineRunForFile,
 } from './output-paths.js';
-import { createOcrVisualization, ocrVisualizationFileName } from './ocr-visualization.js';
+import { ocrVisualizationFileName } from './ocr-visualization.js';
+import {
+  createPhotoOcrCacheKey,
+  readPhotoOcrCache,
+  writePhotoOcrCache,
+} from './photo-ocr-cache.js';
 
 const CATEGORIES = ['menu', 'food', 'interior', 'unknown'];
 const PROMPTS = {
@@ -94,6 +100,13 @@ const explicitLabelsPath = process.env.PHOTO_ANALYSIS_LABELS?.trim()
   : null;
 const modelCacheDir = resolve(process.env.PHOTO_ANALYSIS_MODEL_CACHE?.trim() || '.cache/transformers');
 const ocrCacheDir = resolve(process.env.PHOTO_ANALYSIS_OCR_CACHE?.trim() || '.cache/tesseract');
+const ocrResultCacheDir = resolve(
+  process.env.PHOTO_ANALYSIS_OCR_RESULT_CACHE?.trim() || '.cache/photo-analysis-ocr',
+);
+const ocrResultCacheEnabled = booleanValue(
+  process.env.PHOTO_ANALYSIS_OCR_RESULT_CACHE_ENABLED,
+  true,
+);
 const ocrEngine = (process.env.PHOTO_ANALYSIS_OCR_ENGINE?.trim() || 'paddleocr').toLowerCase();
 const paddlePythonPath = resolve(process.env.PHOTO_ANALYSIS_PADDLE_PYTHON?.trim()
   || '.venv-paddleocr/Scripts/python.exe');
@@ -107,7 +120,7 @@ const placeLimit = optionalPositiveInteger(process.env.PHOTO_ANALYSIS_PLACE_LIMI
 const maxPhotosPerPlace = positiveInteger(process.env.PHOTO_ANALYSIS_MAX_PHOTOS_PER_PLACE, 30);
 const imageSize = positiveInteger(process.env.PHOTO_ANALYSIS_IMAGE_SIZE, 1280);
 const requestTimeoutMs = positiveInteger(process.env.PHOTO_ANALYSIS_REQUEST_TIMEOUT_MS, 30_000);
-const delayMs = nonNegativeInteger(process.env.PHOTO_ANALYSIS_DELAY_MS, 250);
+const delayMs = nonNegativeInteger(process.env.PHOTO_ANALYSIS_DELAY_MS, 0);
 const minimumCategoryScore = decimalBetweenZeroAndOne(process.env.PHOTO_ANALYSIS_MIN_SCORE, 0.42);
 const minimumCategoryMargin = decimalBetweenZeroAndOne(process.env.PHOTO_ANALYSIS_MIN_MARGIN, 0.08);
 const ocrLanguages = (process.env.PHOTO_ANALYSIS_OCR_LANGUAGES?.trim() || 'eng+msa')
@@ -132,6 +145,7 @@ env.allowRemoteModels = true;
 await mkdir(pipelineOutputRoot, { recursive: true });
 await mkdir(modelCacheDir, { recursive: true });
 await mkdir(ocrCacheDir, { recursive: true });
+if (ocrResultCacheEnabled) await mkdir(ocrResultCacheDir, { recursive: true });
 
 if (evaluateOnly) {
   await runEvaluationOnly();
@@ -158,7 +172,6 @@ async function runAnalysis() {
   const labelsPath = labelsPathForRun(runRoot);
   const partialPath = outputFile(runRoot, 'json', 'photo-analysis.partial.json');
   const finalPath = outputFile(runRoot, 'json', 'photo-analysis.json');
-  const ocrVisualizationDir = join(runRoot, 'other', 'ocr-visualizations');
   const startedAt = new Date();
   const report = resumedRun
     ? JSON.parse(await readFile(partialPath, 'utf8'))
@@ -177,6 +190,7 @@ async function runAnalysis() {
   const pendingPlaces = selectedPlaces.filter((place) => !completedKeys.has(placeKey(place)));
   console.log(`Photo analysis: ${selectedPlaces.length} restaurant(s), up to ${maxPhotosPerPlace} photos each.`);
   console.log(`Model: ${modelId} (${modelDtype}, ${device}); OCR: ${ocrEngine}.`);
+  console.log(`OCR result cache: ${ocrResultCacheEnabled ? ocrResultCacheDir : 'disabled'}.`);
   console.log(`Output: ${runRoot}`);
   if (resumedRun) console.log(`Resuming with ${completedKeys.size} restaurant(s) already complete.`);
 
@@ -221,7 +235,7 @@ async function runAnalysis() {
               : await createTesseractOcrRunner();
           }
           return ocrRunner;
-        }, ocrVisualizationDir);
+        });
         imageResults.push(result);
         const ocrText = result.ocr?.status === 'success'
           ? ` OCR=${Math.round(result.ocr.confidence)}%`
@@ -264,7 +278,7 @@ async function runAnalysis() {
   }
 }
 
-async function analyzePhoto(photo, classifier, getOcrWorker, ocrVisualizationDir) {
+async function analyzePhoto(photo, classifier, getOcrWorker) {
   const sourceUrl = photo?.fullSizeImageUrl || photo?.sourceImageUrl || null;
   const base = {
     photoId: photo?.photoId ?? null,
@@ -312,30 +326,20 @@ async function analyzePhoto(photo, classifier, getOcrWorker, ocrVisualizationDir
         const ocrDownloaded = ocrUrl === base.analysisImageUrl
           ? downloaded
           : await downloadImage(ocrUrl, requestTimeoutMs);
-        const runner = await getOcrWorker();
-        result.ocr = await runner.recognize(ocrDownloaded.buffer);
+        result.ocr = await recognizeWithOcrCache({
+          photo,
+          imageUrl: ocrUrl,
+          buffer: ocrDownloaded.buffer,
+          getOcrWorker,
+        });
         if (result.ocr.status === 'success' && result.ocr.lines?.length) {
-          try {
-            const visualizationFileName = ocrVisualizationFileName(result.photoId);
-            const visualizationPath = join(ocrVisualizationDir, visualizationFileName);
-            const visualization = await createOcrVisualization({
-              imageBuffer: ocrDownloaded.buffer,
-              lines: result.ocr.lines,
-              priceCandidates: result.ocr.priceCandidates,
-              outputPath: visualizationPath,
-            });
-            result.ocr.visualization = {
-              status: 'success',
-              relativePath: `other/ocr-visualizations/${visualizationFileName}`,
-              ...visualization,
-            };
-          } catch (visualizationError) {
-            result.ocr.visualization = {
-              status: 'failed',
-              relativePath: null,
-              error: conciseError(visualizationError),
-            };
-          }
+          const visualizationFileName = ocrVisualizationFileName(result.photoId);
+          result.ocr.visualization = {
+            status: 'deferred',
+            relativePath: `other/ocr-visualizations/${visualizationFileName}`,
+            lineCount: result.ocr.lines.length,
+            error: null,
+          };
         }
       } catch (error) {
         result.ocr = {
@@ -355,6 +359,45 @@ async function analyzePhoto(photo, classifier, getOcrWorker, ocrVisualizationDir
   } catch (error) {
     return { ...base, error: conciseError(error) };
   }
+}
+
+async function recognizeWithOcrCache({ photo, imageUrl, buffer, getOcrWorker }) {
+  const cacheKey = createPhotoOcrCacheKey({
+    photoId: photo?.photoId,
+    imageUrl,
+    engine: ocrEngine,
+    imageSize: ocrImageSize,
+    modelSize: ocrEngine === 'paddleocr' ? paddleModelSize : null,
+    languages: ocrEngine === 'tesseract' ? ocrLanguages : null,
+  });
+  if (ocrResultCacheEnabled) {
+    const cached = await readPhotoOcrCache(ocrResultCacheDir, cacheKey);
+    if (cached) {
+      return {
+        ...cached,
+        elapsedSeconds: 0,
+        cache: {
+          status: 'hit',
+          key: cacheKey,
+          sourceElapsedSeconds: numberOrNull(cached.elapsedSeconds),
+        },
+      };
+    }
+  }
+
+  const runner = await getOcrWorker();
+  const recognized = await runner.recognize(buffer);
+  if (ocrResultCacheEnabled) {
+    await writePhotoOcrCache(ocrResultCacheDir, cacheKey, recognized);
+  }
+  return {
+    ...recognized,
+    cache: {
+      status: ocrResultCacheEnabled ? 'miss' : 'disabled',
+      key: ocrResultCacheEnabled ? cacheKey : null,
+      sourceElapsedSeconds: null,
+    },
+  };
 }
 
 async function createTesseractOcrRunner() {
@@ -612,6 +655,10 @@ function createEmptyReport(startedAt) {
       ocrImageSize,
       paddleModelSize: ocrEngine === 'paddleocr' ? paddleModelSize : null,
       paddleCpuThreads: ocrEngine === 'paddleocr' ? paddleCpuThreads : null,
+      ocrResultCacheEnabled,
+      ocrResultCacheDirectory: ocrResultCacheEnabled ? ocrResultCacheDir : null,
+      visualizationMode: 'on_demand',
+      delayMs,
       processingConcurrency: 1,
     },
     confidenceNotice: 'CLIP scores rank the supplied prompts and are not calibrated probabilities.',
@@ -638,6 +685,8 @@ function calculateCounts(restaurants) {
     ])),
     menuOcrSuccess: analyzed.filter((image) => image.ocr?.status === 'success').length,
     menuOcrFailed: analyzed.filter((image) => image.ocr?.status === 'failed').length,
+    menuOcrCacheHits: analyzed.filter((image) => image.ocr?.cache?.status === 'hit').length,
+    menuOcrCacheMisses: analyzed.filter((image) => image.ocr?.cache?.status === 'miss').length,
   };
 }
 

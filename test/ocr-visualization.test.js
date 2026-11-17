@@ -13,6 +13,7 @@ test('creates a safe deterministic OCR visualization filename', () => {
   const first = ocrVisualizationFileName('photo/id:123');
   assert.match(first, /^photo_id_123-[a-f0-9]{12}-ocr\.jpg$/);
   assert.equal(first, ocrVisualizationFileName('photo/id:123'));
+  assert.ok(ocrVisualizationFileName('x'.repeat(500)).length <= 69);
 });
 
 test('marks price lines differently in the OCR overlay', () => {

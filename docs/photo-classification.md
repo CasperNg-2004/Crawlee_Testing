@@ -18,8 +18,13 @@ For each saved photo, the pipeline:
 2. Uses CLIP zero-shot prompts to rank `menu`, `food`, `interior`, and `unknown`.
 3. Converts weak or narrowly separated predictions to `unknown`.
 4. Runs PaddleOCR only when the automatic category is `menu`.
-5. Saves positioned OCR lines, prices, timing, and an annotated JPEG.
+5. Saves positioned OCR lines, prices, and timing. The review website creates
+   the annotated JPEG on demand when **OCR boxes** is opened.
 6. Writes a checkpoint after every restaurant.
+
+Successful OCR results are cached by photo identity, source URL, and OCR
+settings. Re-running an unchanged photo reuses its OCR text; changing the image
+URL, engine, model size, language, or OCR image size causes a cache miss.
 
 Resume an interrupted checkpoint with:
 
@@ -38,13 +43,15 @@ PHOTO_ANALYSIS_MODEL=Xenova/clip-vit-base-patch32
 PHOTO_ANALYSIS_DTYPE=q8
 PHOTO_ANALYSIS_DEVICE=cpu
 PHOTO_ANALYSIS_IMAGE_SIZE=1280
-PHOTO_ANALYSIS_DELAY_MS=250
+PHOTO_ANALYSIS_DELAY_MS=0
 PHOTO_ANALYSIS_MIN_SCORE=0.42
 PHOTO_ANALYSIS_MIN_MARGIN=0.08
 PHOTO_ANALYSIS_OCR_ENGINE=paddleocr
 PHOTO_ANALYSIS_OCR_IMAGE_SIZE=1800
 PHOTO_ANALYSIS_PADDLE_MODEL_SIZE=small
 PHOTO_ANALYSIS_PADDLE_CPU_THREADS=4
+PHOTO_ANALYSIS_OCR_RESULT_CACHE_ENABLED=true
+PHOTO_ANALYSIS_OCR_RESULT_CACHE=.cache/photo-analysis-ocr
 ```
 
 CLIP scores rank the configured prompts. They are not calibrated probabilities.
@@ -86,7 +93,7 @@ The viewer provides:
 - Amber polygons: lines detected as possible prices.
 - Numbered OCR text beside the image for comparison.
 
-New analysis runs save all successful visualizations under:
+Visualizations opened in the review website are saved under:
 
 ```text
 output\Running#N\photo-classification\other\ocr-visualizations\*-ocr.jpg

@@ -9,7 +9,8 @@ export function ocrVisualizationFileName(photoId) {
     .normalize('NFKC')
     .replace(/[^a-zA-Z0-9._-]+/g, '_')
     .replace(/^[_\.]+|[_\.]+$/g, '')
-    .slice(0, 105) || 'unknown-photo';
+    // Keep the complete Windows output path comfortably below legacy MAX_PATH.
+    .slice(0, 48) || 'unknown-photo';
   const digest = createHash('sha256').update(rawId).digest('hex').slice(0, 12);
   return `${safeId}-${digest}-ocr.jpg`;
 }
